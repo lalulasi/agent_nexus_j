@@ -1,0 +1,53 @@
+# docker-compose.yml
+services:
+  # ==================== 基礎設施：Redis (快取與非同步任務佇列) ====================
+  nexus-redis:
+    image: redis:7-alpine
+    container_name: nexus-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - nexus-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ==================== 基礎設施：PostgreSQL (核心資料持久化) ====================
+  nexus-postgres:
+    image: postgres:16-alpine
+    container_name: nexus-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-nexus_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nexus_secret_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-agent_nexus}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - nexus-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-nexus_admin} -d ${POSTGRES_DB:-agent_nexus}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  nexus-network:
+    name: nexus-network
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
