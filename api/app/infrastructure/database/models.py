@@ -3,7 +3,7 @@ from datetime import datetime
 from typing import List
 
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from sqlalchemy import String, DateTime, func, ForeignKey, Text
+from sqlalchemy import String, DateTime, func, ForeignKey, Text, Column, JSON
 
 
 # 1. 声明基类
@@ -25,7 +25,7 @@ class AgentSession(Base):
 
     # 【新增】ORM 关联：一个 Session 对应多条 Message。级联删除保证删会话时，记录也一并清空。
     messages: Mapped[List["Message"]] = relationship("Message", back_populates="session", cascade="all, delete-orphan")
-
+    custom_tools = Column(JSON, default=list)
 
 # 3. 【新增】聊天记录模型
 class Message(Base):

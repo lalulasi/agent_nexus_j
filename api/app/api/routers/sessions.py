@@ -105,12 +105,18 @@ async def chat_with_agent(
         db: AsyncSession = Depends(get_db)
 ):
     logger.info(f"Received new Chat request | Session: {session_id}")
-
     # 1. 验证会话并保存用户消息
     stmt = select(AgentSession).where(AgentSession.id == session_id)
     session = (await db.execute(stmt)).scalars().first()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
+
+    # ==========================================
+    # 🌟 新增功能 1：将前端传来的工具持久化到数据库
+    # ==========================================
+    if chat_req.custom_tools is not None:
+        session.custom_tools = [t.model_dump() for t in chat_req.custom_tools]
+        await db.commit()  # 提交保存到数据库
 
     user_msg = Message(session_id=session_id, role="user", content=chat_req.user_input)
     db.add(user_msg)
@@ -120,6 +126,41 @@ async def chat_with_agent(
     history_stmt = select(Message).where(Message.session_id == session_id).order_by(Message.created_at.asc())
     history_records = (await db.execute(history_stmt)).scalars().all()
     llm_messages = [{"role": m.role, "content": m.content} for m in history_records]
+    # ==========================================
+    # 🌟 增强版功能 2：自动重命名 (仅在第一句话时触发)
+    # ==========================================
+    # 判断是否为第一轮对话 (history_records 长度为 1 代表只有刚才插入的 user_msg)
+    if len(history_records) == 1:
+        # 放宽条件：只要包含"新会话"、"New Session" 或者是空的，就触发
+        if not session.title or "新会话" in session.title or "New Session" in session.title:
+            logger.info("侦测到新会话，准备调用大模型生成标题...")
+            try:
+                title_messages = [
+                    {"role": "system",
+                     "content": "你是一个只输出4到6个字标题的AI。请直接输出标题，绝对不要包含引号或任何标点符号。"},
+                    {"role": "user", "content": f"根据以下内容生成一个简短标题：{chat_req.user_input}"}
+                ]
+
+                # 借用当前的 LLM 引擎生成标题（强制关闭工具）
+                title_reply = await generate_ai_reply(
+                    messages_history=title_messages,
+                    api_key=chat_req.api_key,
+                    base_url=chat_req.base_url,
+                    model_name=chat_req.text_model,
+                    enable_tools=False,
+                    extra_tool_schemas=None  # 确保不带入任何插件
+                )
+
+                # 清理多余的字符
+                new_title = title_reply.content.strip(' \n\r"“”。')
+
+                session.title = new_title
+                db.add(session)
+                await db.commit()
+                await db.refresh(session)  # 刷新对象，防止后续报错
+
+            except Exception as e:
+                logger.error(f"❌ 发生错误！自动命名失败: {str(e)}")
 
     local_custom_tools = {}
     extra_schemas = []
@@ -160,7 +201,8 @@ async def chat_with_agent(
                 api_key=chat_req.api_key,
                 base_url=chat_req.base_url,
                 model_name=target_model,
-                enable_tools=True
+                enable_tools=True,
+                extra_tool_schemas=extra_schemas
             )
         except Exception as e:
             await db.rollback()
@@ -183,7 +225,7 @@ async def chat_with_agent(
 
                 try:
                     t_args = json.loads(t_args_str) if t_args_str else {}
-                    tool_instance = tool_registry.get_tool(t_name)
+                    tool_instance = local_custom_tools.get(t_name) or tool_registry.get_tool(t_name)
 
                     if not tool_instance:
                         raise ValueError(f"Tool '{t_name}' not found in local registry.")

@@ -27,7 +27,7 @@ class SessionResponse(BaseModel):
     model_provider: Optional[str]
     created_at: datetime
     updated_at: datetime
-
+    custom_tools: Optional[List[Any]] = []
     # 关键配置：允许 Pydantic 直接读取 SQLAlchemy 模型对象
     model_config = ConfigDict(from_attributes=True)
 
