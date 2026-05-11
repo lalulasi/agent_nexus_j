@@ -8,9 +8,14 @@ dependencies = [
     "alembic>=1.14.1",
     "asyncpg>=0.30.0",
     "fastapi>=0.115.8",
+    "greenlet>=3.5.0",
+    "httpx>=0.28.1",
     "loguru>=0.7.3",
+    "openai>=2.36.0",
     "pydantic-settings>=2.7.1",
+    "requests>=2.33.1",
     "sqlalchemy>=2.0.38",
+    "streamlit>=1.57.0",
     "uvicorn[standard]>=0.34.0",
 ]
 [dependency-groups]
