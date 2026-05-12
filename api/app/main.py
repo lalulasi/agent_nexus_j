@@ -1,11 +1,12 @@
 from fastapi import FastAPI
 from app.core.config import settings
 from app.core.logger import logger
-
 # === 引入我们刚刚写的路由模块 ===
 from app.api.routers import sessions
 # 初始化系统工具
 import app.infrastructure.tools.builtins.system_time
+from app.infrastructure.database.models import Base # 导入基类
+from app.infrastructure.database.session import engine # 导入引擎
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
