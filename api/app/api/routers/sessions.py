@@ -291,18 +291,7 @@ async def chat_with_agent(
                         )
                     else:
                         logger.success(f"🟢 触发白名单，自动放行安全命令: {cmd_to_run}")
-
-                    logger.critical(f"⚠️ 拦截到高危动作请求: {t_args_str}")
-                    await db.commit()
-                    return MessageResponse(
-                        id=str(uuid.uuid4()),  # 🌟 补齐所需字段
-                        session_id=session_id,
-                        role="assistant",  # 🌟 补齐所需字段
-                        content="Agent 申请执行高危终端命令。",  # 🌟 改成了 content
-                        created_at=datetime.utcnow(),  # 🌟 补齐所需字段
-                        status="requires_action",
-                        pending_action={"name": t_name, "args": t_args_str}
-                    )
+                        pass
 
                 # 普通工具，直接执行
                 logger.debug(f"Preparing to execute tool: '{t_name}'")
