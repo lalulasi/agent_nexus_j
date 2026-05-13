@@ -23,6 +23,6 @@ class GetSystemTimeTool(BaseTool):
 
     async def execute(self, **kwargs) -> str:
         logger.info("Executing GetSystemTimeTool to fetch local time.")
-        current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        current_time = datetime.datetime.now().strftime("%Y-%m-%docs_daily_logs_2026-05-12_work_log.md %H:%M:%S")
         logger.debug(f"Fetched time: {current_time}")
         return f"The current system time is: {current_time}"

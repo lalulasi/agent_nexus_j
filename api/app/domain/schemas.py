@@ -2,15 +2,18 @@ from pydantic import BaseModel, Field, ConfigDict
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 
+
 class CustomAPIToolConfig(BaseModel):
     name: str = Field(..., description="工具名称 (英文，如 get_weather)")
     description: str = Field(..., description="工具描述，告诉 AI 何时使用")
     url: str = Field(..., description="API 目标地址 (POST请求)")
     parameters: Dict[str, Any] = Field(..., description="OpenAI 格式的 JSON Schema")
 
+
 class SessionCreate(BaseModel):
     title: str = Field(default="New Conversation", description="会话的初始标题")
     model_provider: Optional[str] = Field(default="deepseek", description="选用的 AI 模型")
+
 
 class SessionResponse(BaseModel):
     id: str
@@ -21,14 +24,19 @@ class SessionResponse(BaseModel):
     custom_tools: Optional[List[Any]] = []
     model_config = ConfigDict(from_attributes=True)
 
+
 class MessageCreate(BaseModel):
     role: str = Field(..., description="角色：user, assistant, system")
     content: str = Field(..., description="消息文本内容")
 
+
 class ChatRequest(BaseModel):
-    # 🌟 核心修复 2：将 user_input 改为可选字段，默认值为 None！
     user_input: Optional[str] = None
     image_base64: Optional[str] = None
+
+    # 🌟 补齐：接收前端上传的文件名称和内容
+    file_name: Optional[str] = None
+    file_content: Optional[str] = None
 
     api_key: str
     base_url: str
@@ -39,6 +47,7 @@ class ChatRequest(BaseModel):
     action: str = "chat"
     pending_tool_name: Optional[str] = None
     pending_tool_args: Optional[str] = None
+
 
 class MessageResponse(BaseModel):
     id: str
