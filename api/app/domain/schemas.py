@@ -38,6 +38,8 @@ class ChatRequest(BaseModel):
     file_name: Optional[str] = None
     file_content: Optional[str] = None
 
+    system_prompt: Optional[str] = None
+
     api_key: str
     base_url: str
     text_model: str

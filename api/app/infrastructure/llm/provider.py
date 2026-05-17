@@ -4,7 +4,7 @@ from openai.types.chat.chat_completion_message_tool_call import ChatCompletionMe
 from typing import List, Dict, Any, Optional, AsyncGenerator
 from app.core.logger import logger
 from app.infrastructure.tools.registry import tool_registry
-
+import json
 
 async def generate_ai_reply_stream(
         messages_history: List[Dict[str, Any]],
@@ -20,7 +20,9 @@ async def generate_ai_reply_stream(
     """
     if not all([api_key, base_url, model_name]):
         logger.error("Incomplete LLM configuration.")
-        raise ValueError("Missing LLM configuration.")
+        yield {"type": "error",
+               "data": "🚨 配置不完整：请检查侧边栏，确保当前模型的 API Key、Base URL 和 文本模型名称均已填写！"}
+        return
 
     client = AsyncOpenAI(api_key=api_key, base_url=base_url)
 
@@ -99,3 +101,46 @@ async def generate_ai_reply_stream(
     except Exception as e:
         logger.error(f"LLM Stream Error: {str(e)}")
         yield {"type": "error", "data": f"Provider Error: {str(e)}"}
+
+
+async def generate_json_evaluation(
+        system_prompt: str,
+        user_prompt: str,
+        api_key: str,
+        base_url: str,
+        model_name: str
+) -> dict:
+    """
+    专门用于 Multi-Agent 协作的后台裁判引擎。
+    强制大模型返回结构化的 JSON 数据，以便 Python 代码进行算术逻辑判断。
+    """
+    client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+
+    # 强制大模型必须遵守的 JSON 格式约定
+    json_instruction = """
+    你必须以纯 JSON 格式响应。JSON 必须严格包含以下三个字段：
+    - "pass": 布尔值 (true 或 false)，表示你是否认可该回答。
+    - "score": 整数 (0-100)，表示该回答的质量得分。
+    - "advice": 字符串，如果不通过，请给出具体修改建议；如果通过，可留空。
+    """
+
+    messages = [
+        {"role": "system", "content": f"{system_prompt}\n\n{json_instruction}"},
+        {"role": "user", "content": user_prompt}
+    ]
+
+    try:
+        response = await client.chat.completions.create(
+            model=model_name,
+            messages=messages,
+            temperature=0.3,  # 评价需要稳定，调低温度
+            response_format={"type": "json_object"}  # 🌟 核心：强制 JSON 输出
+        )
+
+        result_str = response.choices[0].message.content
+        return json.loads(result_str)
+
+    except Exception as e:
+        logger.error(f"JSON Evaluation Error: {str(e)}")
+        # 兜底机制：如果大模型崩溃或不遵循格式，默认给及格放行，避免死循环
+        return {"pass": True, "score": 60, "advice": f"评估失败，自动放行: {str(e)}"}

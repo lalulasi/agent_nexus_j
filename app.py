@@ -59,6 +59,36 @@ def load_config():
     }
 
 
+PERSONA_FILE = ".agent_personas.json"
+
+def load_personas():
+    if os.path.exists(PERSONA_FILE):
+        try:
+            with open(PERSONA_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            pass
+    return {
+        "🌐 原生模式 (无预设)": "",  # 🌟 新增：空字符串代表不发送 System Prompt
+        "🤖 通用助手": "你是一个有用的AI助手。回答简明扼要。",
+        "🐧 Linux 运维专家": "你是一个资深的服务器运维专家。尽量不闲聊，遇到问题直接输出可执行的 Bash 命令或脚本，并对高危命令做出提醒。",
+        "✍️ 毒舌代码审查员": "你是一个极其挑剔的资深程序员，专门做 Code Review。请用尖锐、幽默且一针见血的语气指出用户代码里的愚蠢错误，然后给出优雅的重构方案。"
+    }
+
+if "personas" not in st.session_state:
+    st.session_state.personas = load_personas()
+if "active_persona" not in st.session_state:
+    st.session_state.active_persona = "🌐 原生模式 (无预设)"  # 🌟 默认选中原生模式
+
+def save_all_personas(personas):
+    with open(PERSONA_FILE, "w", encoding="utf-8") as f:
+        json.dump(personas, f, ensure_ascii=False, indent=2)
+
+if "personas" not in st.session_state:
+    st.session_state.personas = load_personas()
+if "active_persona" not in st.session_state:
+    st.session_state.active_persona = "🤖 通用助手"
+
 def save_all_configs(configs):
     to_save = {}
     for p, d in configs.items():
@@ -119,6 +149,56 @@ with st.sidebar:
                     del st.session_state.user_config[selected_provider]
                     save_all_configs(st.session_state.user_config)
                     st.rerun()
+
+        # ==========================================
+        # 🎭 角色面具箱 (System Prompts)
+        # ==========================================
+    with st.expander("🎭 角色面具 (System Prompts)", expanded=False):
+        persona_keys = list(st.session_state.personas.keys())
+        if not persona_keys:
+            persona_keys = ["🌐 原生模式 (无预设)"]
+            st.session_state.personas = {"🌐 原生模式 (无预设)": ""}
+
+        c_psel, c_pdel = st.columns([5, 1])
+        with c_psel:
+            selected_persona = st.selectbox("选择当前角色", persona_keys + ["➕ 新增角色..."],
+                                            label_visibility="collapsed")
+        with c_pdel:
+            # 🌟 保护机制：不允许删除原生模式
+            if selected_persona not in ["➕ 新增角色...", "🌐 原生模式 (无预设)"] and st.button("🗑️", key="del_persona",
+                                                                                              help="删除角色"):
+                del st.session_state.personas[selected_persona]
+                save_all_personas(st.session_state.personas)
+                st.rerun()
+
+        st.divider()
+
+        # 🌟 针对原生模式的专属 UI 显示
+        if selected_persona == "🌐 原生模式 (无预设)":
+            st.info("💡 当前使用大模型官方原生设定，将不会向后端发送任何系统提示词。")
+            st.session_state.active_persona = selected_persona
+        elif selected_persona == "➕ 新增角色...":
+            p_name = st.text_input("给新角色起名 (如: 翻译官)", value="")
+            p_content = st.text_area("System Prompt", value="", height=100)
+        else:
+            p_name = selected_persona
+            p_content = st.text_area("System Prompt", value=st.session_state.personas.get(selected_persona, ""),
+                                     height=100)
+            st.session_state.active_persona = selected_persona
+
+        # 🌟 保护机制：原生模式不需要保存按钮
+        if selected_persona != "🌐 原生模式 (无预设)":
+            if st.button("💾 保存角色", use_container_width=True):
+                if not p_name.strip():
+                    st.error("角色名不能为空！")
+                elif not p_content.strip():
+                    st.error("Prompt 不能为空！")
+                else:
+                    st.session_state.personas[p_name] = p_content
+                    save_all_personas(st.session_state.personas)
+                    st.toast(f"✅ 角色 [{p_name}] 已保存")
+                    st.session_state.active_persona = p_name
+                    if selected_persona == "➕ 新增角色...": st.rerun()
 
     if st.button("✨ 开启新工作流", use_container_width=True, type="primary"):
         active_provider = selected_provider if selected_provider != "➕ 新增模型配置..." else "未知模型"
@@ -195,8 +275,12 @@ if st.session_state.pending_action:
         t_args = st.session_state.pending_action.get("args")
         st.code(t_args, language="json")
         col1, col2 = st.columns(2)
-        btn_payload = {"api_key": user_api_key, "base_url": user_base_url, "text_model": user_text_model,
-                       "vision_model": user_vision_model, "custom_tools": st.session_state.custom_tools}
+        btn_payload = {
+            "api_key": user_api_key, "base_url": user_base_url,
+            "text_model": user_text_model, "vision_model": user_vision_model,
+            "custom_tools": st.session_state.custom_tools,
+            "system_prompt": st.session_state.personas.get(st.session_state.active_persona, "") # 🌟 附带面具
+        }
         if col1.button("✅ 允许", type="primary", use_container_width=True):
             btn_payload.update({"action": "approve_tool", "pending_tool_name": t_name, "pending_tool_args": t_args})
             st.session_state.run_stream = btn_payload
@@ -247,9 +331,14 @@ if "run_stream" in st.session_state:
 
 if prompt := st.chat_input("输入指令...", disabled=bool(st.session_state.pending_action)):
     with st.chat_message("user", avatar="🧑‍💻"): st.markdown(prompt)
-    payload = {"action": "chat", "user_input": prompt, "api_key": user_api_key, "base_url": user_base_url,
-               "text_model": user_text_model, "vision_model": user_vision_model,
-               "custom_tools": st.session_state.custom_tools, "file_name": st.session_state.get("file_name"),
-               "file_content": st.session_state.get("file_content")}
+    payload = {
+        "action": "chat", "user_input": prompt,
+        "api_key": user_api_key, "base_url": user_base_url,
+        "text_model": user_text_model, "vision_model": user_vision_model,
+        "custom_tools": st.session_state.custom_tools,
+        "file_name": st.session_state.get("file_name"),
+        "file_content": st.session_state.get("file_content"),
+        "system_prompt": st.session_state.personas.get(st.session_state.active_persona, "")  # 🌟 附带面具
+    }
     handle_streaming_request(payload)
     st.rerun()

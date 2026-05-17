@@ -126,6 +126,17 @@ async def chat_with_agent(session_id: str, chat_req: ChatRequest, db: AsyncSessi
         history_stmt = select(Message).where(Message.session_id == session_id).order_by(Message.created_at.asc())
         history_records = (await db.execute(history_stmt)).scalars().all()
         llm_messages = []
+
+        # 🌟 核心面具注入逻辑：如果前端传了设定，强行插在记忆最前方！
+        if chat_req.system_prompt:
+            llm_messages.append({"role": "system", "content": chat_req.system_prompt})
+
+        for m in history_records:
+            if m.role == "tool":
+                llm_messages.append({"role": "user", "content": f"🔧 [历史记录-工具执行结果]:\n{m.content}"})
+            else:
+                llm_messages.append({"role": m.role, "content": m.content})
+
         for m in history_records:
             if m.role == "tool":
                 llm_messages.append({"role": "user", "content": f"🔧 [历史记录-工具执行结果]:\n{m.content}"})
