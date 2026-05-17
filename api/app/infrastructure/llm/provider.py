@@ -114,15 +114,18 @@ async def generate_json_evaluation(
     专门用于 Multi-Agent 协作的后台裁判引擎。
     强制大模型返回结构化的 JSON 数据，以便 Python 代码进行算术逻辑判断。
     """
+    # 🌟 新增：出征日志！
+    logger.info(f"🔍 [Swarm 审查] 唤醒副脑模型: [{model_name}] 开始进行逻辑打分...")
+
     client = AsyncOpenAI(api_key=api_key, base_url=base_url)
 
     # 强制大模型必须遵守的 JSON 格式约定
     json_instruction = """
-    你必须以纯 JSON 格式响应。JSON 必须严格包含以下三个字段：
-    - "pass": 布尔值 (true 或 false)，表示你是否认可该回答。
-    - "score": 整数 (0-100)，表示该回答的质量得分。
-    - "advice": 字符串，如果不通过，请给出具体修改建议；如果通过，可留空。
-    """
+        你必须以纯 JSON 格式响应。JSON 必须严格包含以下三个字段：
+        - "pass": 布尔值 (true 或 false)，表示你是否认可该回答。
+        - "score": 整数 (0-100)，表示该回答的质量得分。
+        - "advice": 字符串。请详细写出你的评价理由。如果不通过，指出修改建议；如果通过，指出它的优点，绝对不能为空！
+        """
 
     messages = [
         {"role": "system", "content": f"{system_prompt}\n\n{json_instruction}"},
@@ -133,14 +136,37 @@ async def generate_json_evaluation(
         response = await client.chat.completions.create(
             model=model_name,
             messages=messages,
-            temperature=0.3,  # 评价需要稳定，调低温度
-            response_format={"type": "json_object"}  # 🌟 核心：强制 JSON 输出
+            temperature=0.1,  # 🌟 调低温度，让 JSON 输出更稳定
+            response_format={"type": "json_object"}
         )
 
-        result_str = response.choices[0].message.content
-        return json.loads(result_str)
+        result_str = response.choices[0].message.content or ""
+        result_str = result_str.strip()
+
+        # 🌟 强力剥离：使用 chr(96) 动态生成反引号，完美避开聊天界面的渲染 Bug！
+        bt = chr(96) * 3
+        if result_str.startswith(f"{bt}json\n"):
+            result_str = result_str[8:]
+        elif result_str.startswith(f"{bt}json"):
+            result_str = result_str[7:]
+        elif result_str.startswith(bt):
+            result_str = result_str[3:]
+        if result_str.endswith(bt): result_str = result_str[:-3]
+
+        result_str = result_str.strip()
+        # ... (上面是强力剥离反引号的代码) ...
+        if not result_str:
+            raise ValueError("大模型返回了空字符串")
+
+        # 🌟 优化日志：解析完成后，立刻在后台打印打分结果！
+        result_dict = json.loads(result_str)
+        logger.info(
+            f"📊 [Swarm 审查完成] 模型 [{model_name}] | 分数: {result_dict.get('score')} | 意见: {result_dict.get('advice', '无')[:50]}...")
+
+        return result_dict
 
     except Exception as e:
-        logger.error(f"JSON Evaluation Error: {str(e)}")
-        # 兜底机制：如果大模型崩溃或不遵循格式，默认给及格放行，避免死循环
-        return {"pass": True, "score": 60, "advice": f"评估失败，自动放行: {str(e)}"}
+    # 🌟 优化日志：明确打出是哪个 Model 崩溃了，方便精准溯源！
+        logger.error(
+            f"❌ [Swarm 报错] 模型 [{model_name}] 审查失败！Error: {str(e)} | Raw: {result_str if 'result_str' in locals() else 'None'}")
+        return {"pass": True, "score": 60, "advice": f"({model_name} 审查异常，自动放行)"}

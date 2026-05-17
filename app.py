@@ -24,6 +24,8 @@ if "messages" not in st.session_state: st.session_state.messages = []
 if "custom_tools" not in st.session_state: st.session_state.custom_tools = []
 if "pending_action" not in st.session_state: st.session_state.pending_action = None
 if "rename_id" not in st.session_state: st.session_state.rename_id = None
+if "pending_model_install" not in st.session_state: st.session_state.pending_model_install = None
+if "interrupted_payload" not in st.session_state: st.session_state.interrupted_payload = None
 
 
 def encrypt_key(key: str) -> str:
@@ -150,9 +152,9 @@ with st.sidebar:
                     save_all_configs(st.session_state.user_config)
                     st.rerun()
 
-        # ==========================================
-        # 🎭 角色面具箱 (System Prompts)
-        # ==========================================
+    # ==========================================
+    # 🎭 角色面具箱 (System Prompts)
+    # ==========================================
     with st.expander("🎭 角色面具 (System Prompts)", expanded=False):
         persona_keys = list(st.session_state.personas.keys())
         if not persona_keys:
@@ -199,6 +201,37 @@ with st.sidebar:
                     st.toast(f"✅ 角色 [{p_name}] 已保存")
                     st.session_state.active_persona = p_name
                     if selected_persona == "➕ 新增角色...": st.rerun()
+
+        # ==========================================
+         # 🛸 舰队编排区 (Orchestration)
+        # ==========================================
+    st.divider()
+    st.markdown("### 🛸 智能体舰队编排")
+
+    config_keys = list(st.session_state.user_config.keys())
+    if not config_keys: config_keys = ["未配置模型"]
+
+    # 🌟 核心：多选模型，第一个为主脑
+    selected_providers = st.multiselect(
+        "选择出战模型 (1~5个，首个为主脑/裁判)",
+        config_keys,
+        default=[config_keys[0]] if config_keys else None,
+        max_selections=5
+    )
+
+    # 🌟 核心：只有选择了多个模型，才显示协作模式开关
+    swarm_mode = None
+    if len(selected_providers) > 1:
+        swarm_mode_label = st.radio(
+            "⚔️ 选择多智能体协作模式",
+                ["👑 主从迭代 (Maker-Checker)", "🎪 圆桌会议 (Roundtable)"]
+        )
+        swarm_mode = "maker_checker" if "主从" in swarm_mode_label else "roundtable"
+    elif len(selected_providers) == 1:
+        st.caption("ℹ️ 单模型模式：直接对话，支持工具调用。")
+    else:
+        st.warning("⚠️ 请至少选择一个模型。")
+
 
     if st.button("✨ 开启新工作流", use_container_width=True, type="primary"):
         active_provider = selected_provider if selected_provider != "➕ 新增模型配置..." else "未知模型"
@@ -268,6 +301,9 @@ for msg in st.session_state.messages:
         with st.chat_message(msg["role"], avatar=avatar):
             st.markdown(msg["content"])
 
+# ==========================================
+# 🛑 拦截器 1：高危操作授权请求
+# ==========================================
 if st.session_state.pending_action:
     with st.chat_message("assistant", avatar="✨"):
         st.error("🚨 **高危操作授权请求**")
@@ -275,12 +311,9 @@ if st.session_state.pending_action:
         t_args = st.session_state.pending_action.get("args")
         st.code(t_args, language="json")
         col1, col2 = st.columns(2)
-        btn_payload = {
-            "api_key": user_api_key, "base_url": user_base_url,
-            "text_model": user_text_model, "vision_model": user_vision_model,
-            "custom_tools": st.session_state.custom_tools,
-            "system_prompt": st.session_state.personas.get(st.session_state.active_persona, "") # 🌟 附带面具
-        }
+        btn_payload = {"api_key": user_api_key, "base_url": user_base_url, "text_model": user_text_model,
+                       "vision_model": user_vision_model, "custom_tools": st.session_state.custom_tools,
+                       "system_prompt": st.session_state.personas.get(st.session_state.active_persona, "")}
         if col1.button("✅ 允许", type="primary", use_container_width=True):
             btn_payload.update({"action": "approve_tool", "pending_tool_name": t_name, "pending_tool_args": t_args})
             st.session_state.run_stream = btn_payload
@@ -292,53 +325,147 @@ if st.session_state.pending_action:
             st.session_state.pending_action = None
             st.rerun()
 
+# ==========================================
+# 🛑 拦截器 2：按需加载本地模型弹窗 (核心修复点)
+# ==========================================
+if st.session_state.get("pending_model_install"):
+    m_name = st.session_state.pending_model_install
+    with st.chat_message("assistant", avatar="⚙️"):
+        st.warning(
+            f"💡 **系统提示：按需加载本地神经中枢**\n\n为激活高级多智能体协作（意图路由与极速审查），系统需要挂载轻量级本地大脑 `{m_name}`。这将占用约 1.5GB 本地资源。")
+        c1, c2 = st.columns(2)
 
+        if c1.button("✅ 同意并自动安装 (推荐)", type="primary", use_container_width=True):
+            btn_payload = st.session_state.interrupted_payload.copy()
+            btn_payload["action"] = "pull_local_model"
+            st.session_state.run_stream = btn_payload
+            st.session_state.pending_model_install = None
+            st.rerun()
+
+        if c2.button("🚫 暂不安装 (退回单聊)", use_container_width=True):
+            st.session_state.pending_model_install = None
+            st.session_state.interrupted_payload = None
+            st.rerun()
+
+
+# ==========================================
+# ⚡ 核心流式处理函数
+# ==========================================
 def handle_streaming_request(payload):
     full_response = ""
     with st.chat_message("assistant", avatar="✨"):
-        placeholder = st.empty()
+        status_placeholder = st.empty()
+        text_placeholder = st.empty()
+        progress_bar = st.empty()  # 🌟 新增用于渲染下载进度的占位符
+
         try:
             with requests.post(f"{API_BASE_URL}/sessions/{st.session_state.session_id}/chat", json=payload,
                                stream=True) as r:
                 if r.status_code != 200:
                     st.error(f"后端报错: {r.text}");
                     return
+
                 for line in r.iter_lines():
                     if line:
                         decoded = line.decode('utf-8')
                         if decoded.startswith('data: '):
                             data = json.loads(decoded[6:])
-                            if data['type'] == 'chunk':
+
+                            if data['type'] == 'status':
+                                status_placeholder.info(f"🌀 {data['content']}")
+
+                            elif data['type'] == 'chunk':
                                 full_response += data['content']
-                                placeholder.markdown(full_response + "▌")
+                                text_placeholder.markdown(full_response + "▌")
+
                             elif data['type'] == 'requires_action':
                                 st.session_state.pending_action = {"name": data['name'], "args": data['args']}
                                 st.rerun()
+
                             elif data['type'] == 'error':
                                 st.error(data['content']);
                                 return
-            placeholder.markdown(full_response)
+
+                            # 👇 就是这里！你原来漏掉了这三个关键信号的拦截 👇
+                            elif data['type'] == 'requires_local_model':
+                                st.session_state.pending_model_install = data['model_name']
+                                st.session_state.interrupted_payload = payload
+                                st.rerun()
+
+                            elif data['type'] == 'pull_progress':
+                                total = data.get('total', 1)
+                                completed = data.get('completed', 0)
+                                if total > 1 and completed > 0:
+                                    pct = min(completed / total, 1.0)
+                                    progress_bar.progress(pct,
+                                                          text=f"📥 正在挂载 {data.get('status')}... {int(pct * 100)}%")
+                                else:
+                                    status_placeholder.info(f"⏳ {data.get('status')}...")
+
+                            elif data['type'] == 'pull_success':
+                                progress_bar.empty()
+                                status_placeholder.success("✅ 本地中枢挂载完毕！正在继续执行原任务...")
+                                import time;
+                                time.sleep(1)
+                                st.session_state.run_stream = st.session_state.interrupted_payload
+                                st.rerun()
+
+            # 流结束时，清空临时状态条，定格最终文本
+            status_placeholder.empty()
+            text_placeholder.markdown(full_response)
+
             if uploaded_file: st.session_state.last_sent_file_id = uploaded_file.file_id
             refresh_messages()
+
         except Exception as e:
             st.error(f"连接异常: {e}")
 
 
+# ==========================================
+# 🚀 触发与执行区
+# ==========================================
 if "run_stream" in st.session_state:
     p = st.session_state.pop("run_stream")
-    handle_streaming_request(p);
+    handle_streaming_request(p)
     st.rerun()
 
-if prompt := st.chat_input("输入指令...", disabled=bool(st.session_state.pending_action)):
-    with st.chat_message("user", avatar="🧑‍💻"): st.markdown(prompt)
+# 🌟 修复：如果正在等待模型安装，禁用输入框
+is_disabled = bool(st.session_state.get("pending_action")) or bool(st.session_state.get("pending_model_install"))
+
+if prompt := st.chat_input("输入指令...", disabled=is_disabled):
+    if not selected_providers:
+        st.error("请先在侧边栏选择至少一个模型！")
+        st.stop()
+
+    with st.chat_message("user", avatar="🧑‍💻"):
+        st.markdown(prompt)
+
+    # 🌟 组装全新的 Swarm 舰队参数
+    swarm_nodes = []
+    for p_name in selected_providers:
+        cfg = st.session_state.user_config.get(p_name, {})
+        swarm_nodes.append({
+            "provider_name": p_name,
+            "api_key": cfg.get("api_key", ""),
+            "base_url": cfg.get("base_url", ""),
+            "text_model": cfg.get("text_model", "")
+        })
+
+    # 兼容原版的首发参数 (取舰队第一个为默认)
+    primary = swarm_nodes[0]
+
     payload = {
         "action": "chat", "user_input": prompt,
-        "api_key": user_api_key, "base_url": user_base_url,
-        "text_model": user_text_model, "vision_model": user_vision_model,
+        "api_key": primary["api_key"], "base_url": primary["base_url"],
+        "text_model": primary["text_model"],
+        "vision_model": st.session_state.user_config.get(selected_providers[0], {}).get("vision_model", ""),
         "custom_tools": st.session_state.custom_tools,
         "file_name": st.session_state.get("file_name"),
         "file_content": st.session_state.get("file_content"),
-        "system_prompt": st.session_state.personas.get(st.session_state.active_persona, "")  # 🌟 附带面具
+        "system_prompt": st.session_state.personas.get(st.session_state.active_persona, ""),
+        "swarm_mode": swarm_mode,
+        "swarm_nodes": swarm_nodes
     }
+
     handle_streaming_request(payload)
     st.rerun()

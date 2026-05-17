@@ -29,22 +29,30 @@ class MessageCreate(BaseModel):
     role: str = Field(..., description="角色：user, assistant, system")
     content: str = Field(..., description="消息文本内容")
 
+# 🌟 新增：代表多智能体网络中的一个节点
+class SwarmNode(BaseModel):
+    provider_name: str
+    api_key: str
+    base_url: str
+    text_model: str
 
 class ChatRequest(BaseModel):
     user_input: Optional[str] = None
     image_base64: Optional[str] = None
-
-    # 🌟 补齐：接收前端上传的文件名称和内容
     file_name: Optional[str] = None
     file_content: Optional[str] = None
-
     system_prompt: Optional[str] = None
 
+    # 兼容原有的单模型模式
     api_key: str
     base_url: str
     text_model: str
     vision_model: Optional[str] = None
     custom_tools: Optional[List[CustomAPIToolConfig]] = Field(default_factory=list)
+
+    # 🌟 新增：多智能体协作专用字段
+    swarm_mode: Optional[str] = None  # 可选值: "maker_checker" 或 "roundtable"
+    swarm_nodes: Optional[List[SwarmNode]] = Field(default_factory=list)
 
     action: str = "chat"
     pending_tool_name: Optional[str] = None
