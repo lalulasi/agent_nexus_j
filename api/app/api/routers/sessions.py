@@ -235,7 +235,12 @@ async def chat_with_agent(session_id: str, chat_req: ChatRequest, db: AsyncSessi
         if chat_req.swarm_mode and chat_req.swarm_nodes:
             logger.info(
                 f"🚀 [Swarm] 启动协作网络 | 模式: {chat_req.swarm_mode} | 参战模型: {[n.text_model for n in chat_req.swarm_nodes]}")
-
+            # 🌟 核心新增：单模型自动降级为极速直连模式
+            if len(chat_req.swarm_nodes) == 1:
+                yield f"data: {json.dumps({'type': 'status', 'content': '⚡ 仅检测到单模型，已自动降级为极速直连模式...'})}\n\n"
+                chat_req.swarm_mode = None  # 强行关闭 Swarm 模式，让它流转到最下方的普通单聊逻辑
+            else:
+                yield f"data: {json.dumps({'type': 'status', 'content': '🚀 指令已接收，直接唤醒主脑舰队...'})}\n\n"
             # ------------------------------------------
             # ⚔️ 分支 A：主从迭代模式
             # ------------------------------------------
@@ -359,36 +364,80 @@ async def chat_with_agent(session_id: str, chat_req: ChatRequest, db: AsyncSessi
             # ------------------------------------------
             # ⚔️ 分支 B：圆桌会议模式
             # ------------------------------------------
-            elif chat_req.swarm_mode == "roundtable":
-                participants = list(chat_req.swarm_nodes)  # 🌟 纯净的参会者列表，不再混入本地模型
+            # ------------------------------------------
+            # ⚔️ 分支 B：圆桌会议模式 (Map-Reduce 融合算法)
+            # ------------------------------------------
+            elif chat_req.swarm_mode == "roundtable" and len(chat_req.swarm_nodes) > 0:
+                participants = list(chat_req.swarm_nodes)
+                judge = participants[0]  # 🌟 核心：用户勾选的第一个模型作为首席主脑 (Judge)
 
                 yield f"data: {json.dumps({'type': 'status', 'content': f'🎪 启动圆桌会议 | {len(participants)} 位专家并发思考中...'})}\n\n"
 
+                # ==========================================
+                # 🗺️ 阶段 1：Map (并发映射) - 获取所有专家的独立观点
+                # ==========================================
                 async def get_node_answer(n):
                     ans = ""
-                    async for ev in generate_ai_reply_stream(llm_messages, n.api_key, n.base_url, n.text_model,
-                                                                 False, None):
-                        if ev["type"] == "text_chunk": ans += ev["data"]
-                    return f"【{n.provider_name} 的观点】:\n{ans}"
+                    # 专家们在后台默默思考，不向前端推流，避免画面混乱
+                    async for ev in generate_ai_reply_stream(llm_messages, n.api_key, n.base_url, n.text_model, False,
+                                                             None):
+                        if ev["type"] == "text_chunk":
+                            ans += ev["data"]
+                    return f"【{n.provider_name} 的独立见解】:\n{ans}\n"
 
+                # 并发执行，收集答案
                 tasks = [get_node_answer(node) for node in participants]
                 answers = await asyncio.gather(*tasks, return_exceptions=True)
-                valid_answers = [a for a in answers if isinstance(a, str)]
 
-                yield f"data: {json.dumps({'type': 'status', 'content': '⚖️ 意见收集完毕，首席主脑正在融合终极答案...'})}\n\n"
+                # 过滤掉网络超时或报错的结果，保证主脑不被报错信息污染
+                valid_answers = [a for a in answers if isinstance(a, str) and a.strip()]
 
-                judge = chat_req.swarm_nodes[0]
-                synthesis_prompt = f"你是圆桌会议的主席。针对用户的问题，以下是各位专家的意见：\n\n{chr(10).join(valid_answers)}\n\n请你综合各方优缺点，给出一份无可挑剔的最终回答。"
-                judge_messages = [{"role": "system", "content": synthesis_prompt},
-                                      {"role": "user", "content": chat_req.user_input}]
+                yield f"data: {json.dumps({'type': 'status', 'content': f'⚖️ 意见收集完毕 ({len(valid_answers)}/{len(participants)} 成功)，首席法官 [{judge.provider_name}] 正在进行降维融合...'})}\n\n"
+
+                # ==========================================
+                # 🗜️ 阶段 2：Reduce (归约) & Resolution (裁决)
+                # ==========================================
+                # 强迫主脑使用 Zero-Shot CoT (思维链) 进行结构化信息降维
+                synthesis_prompt = f"""你是本次多智能体圆桌会议的首席法官(Judge)。
+        【重要业务背景】：用户当前期望回答者扮演以下角色/遵循以下规则：“{chat_req.system_prompt}”。请你在裁决时，也将此规则纳入考量。
+        针对用户的问题，以下是各位专家的独立解答：
+        ====================
+        {chr(10).join(valid_answers)}
+        ====================
+    
+        请你运用 Map-Reduce 融合算法，严格按照以下 Markdown 格式进行思考和输出：
+    
+        > 🎪 **多智能体圆桌会议 - 首席法官综合纪要**
+        > 
+        > **🟢 核心共识**：
+        > (高度提炼所有专家达成一致的关键事实或方案)
+        > 
+        > **🔴 关键分歧 / 独到见解**：
+        > (指出专家们意见冲突的地方，或者某位专家提出的独特盲区)
+        > 
+        > **⚖️ 法官裁决**：
+        > (针对上述分歧，给出你的最终专业判断及取舍理由)
+    
+        ---
+    
+        (在此处输出你融合各方智慧后的【最终完美解答】，直接回答用户问题，不要再写多余的客套话)
+        """
+                # 构造主脑的 messages：系统提示词 (包含所有专家意见) + 用户的原始问题
+                judge_messages = [
+                    {"role": "system", "content": synthesis_prompt},
+                    {"role": "user", "content": chat_req.user_input}
+                ]
 
                 full_response = ""
+
+                # 🌟 主脑开始流式输出《综合纪要》和《最终答案》
                 async for event in generate_ai_reply_stream(judge_messages, judge.api_key, judge.base_url,
-                                                                judge.text_model, False, None):
+                                                            judge.text_model, False, None):
                     if event["type"] == "text_chunk":
                         full_response += event["data"]
                         yield f"data: {json.dumps({'type': 'chunk', 'content': event['data']})}\n\n"
 
+                # 保存最终结果入库 (纪要和答案会被一并保存为历史记忆)
                 db.add(Message(session_id=session_id, role="assistant", content=full_response))
                 await db.commit()
                 yield f"data: {json.dumps({'type': 'completed', 'content': full_response})}\n\n"

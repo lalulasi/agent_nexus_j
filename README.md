@@ -29,3 +29,5 @@ agent_nexus_j/
 ├── .env                        # 全局环境变量配置 (注意防泄漏)
 └── README.md                   # 项目说明文档
 
+uv run python -m app.main
+uv run streamlit run app.py

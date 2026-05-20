@@ -202,37 +202,49 @@ with st.sidebar:
                     st.session_state.active_persona = p_name
                     if selected_persona == "➕ 新增角色...": st.rerun()
 
-        # ==========================================
-         # 🛸 舰队编排区 (Orchestration)
-        # ==========================================
+    # ==========================================
+    # 🛸 舰队编排区 (Orchestration)
+    # ==========================================
     st.divider()
-    st.markdown("### 🛸 智能体舰队编排")
+    st.markdown("### 🛸 智能体调度中心")
 
     config_keys = list(st.session_state.user_config.keys())
     if not config_keys: config_keys = ["未配置模型"]
 
-    # 🌟 核心：多选模型，第一个为主脑
-    selected_providers = st.multiselect(
-        "选择出战模型 (1~5个，首个为主脑/裁判)",
-        config_keys,
-        default=[config_keys[0]] if config_keys else None,
-        max_selections=5
-    )
+    # 🌟 核心 UX 升级：引入高级模式总开关
+    enable_swarm = st.toggle("🌌 启用多智能体协作网络", value=False, help="开启后可同时调度多个大模型进行深度逻辑博弈。")
 
-    # 🌟 核心：只有选择了多个模型，才显示协作模式开关
     swarm_mode = None
-    if len(selected_providers) > 1:
-        swarm_mode_label = st.radio(
-            "⚔️ 选择多智能体协作模式",
-                ["👑 主从迭代 (Maker-Checker)", "🎪 圆桌会议 (Roundtable)"]
-        )
-        swarm_mode = "maker_checker" if "主从" in swarm_mode_label else "roundtable"
-    elif len(selected_providers) == 1:
-        st.caption("ℹ️ 单模型模式：直接对话，支持工具调用。")
+    selected_providers = []
+
+    if not enable_swarm:
+        # 🟢 单兵作战模式 (极简 UI)
+        selected_single = st.selectbox("当前主脑 (单模型极速响应)", config_keys)
+        selected_providers = [selected_single]
+        st.caption("ℹ️ 单机直连：适合日常对话、代码补全与基础问答。")
+
     else:
-        st.warning("⚠️ 请至少选择一个模型。")
+        # 🔴 舰队编排模式 (高级 UI)
+        st.markdown("##### ⚙️ 舰队编排")
+        selected_providers = st.multiselect(
+            "选择出战模型 (1~5个，首个为裁判)",
+            config_keys,
+            default=[config_keys[0]] if config_keys else None,
+            max_selections=5
+        )
 
+        if len(selected_providers) > 1:
+            swarm_mode_label = st.radio(
+                "⚔️ 选择战术阵型",
+                ["👑 主从迭代 (Maker-Checker)", "🎪 圆桌会议 (Roundtable)"]
+            )
+            swarm_mode = "maker_checker" if "主从" in swarm_mode_label else "roundtable"
+        elif len(selected_providers) == 1:
+            st.warning("⚠️ 舰队目前仅有一艘船，将自动降级为单兵模式。")
+        else:
+            st.error("⚠️ 请至少编排一个模型！")
 
+    # ==========================================
     if st.button("✨ 开启新工作流", use_container_width=True, type="primary"):
         active_provider = selected_provider if selected_provider != "➕ 新增模型配置..." else "未知模型"
         res = requests.post(f"{API_BASE_URL}/sessions/", json={"title": "新会话", "model_provider": active_provider})
