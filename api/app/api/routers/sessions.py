@@ -14,15 +14,16 @@ from app.infrastructure.llm.provider import generate_ai_reply_stream, generate_j
 from app.core.logger import logger
 from app.infrastructure.tools.registry import tool_registry
 from app.infrastructure.tools.dynamic_api import DynamicAPITool
-from openai import AsyncOpenAI  # 引入原生客户端用于标题生成
-import asyncio # 🌟 确保导入了 asyncio 用于并发
+from openai import AsyncOpenAI
+import asyncio
 import httpx
 
 from app.domain.schemas import SwarmNode
 
 router = APIRouter(prefix="/sessions", tags=["Agent Sessions"])
 
-LOCAL_BRAIN_MODEL = "qwen3.5:2b" # 🌟 我们选定的本地神经中枢
+LOCAL_BRAIN_MODEL = "qwen3.5:2b"
+
 
 @router.post("/", response_model=SessionResponse)
 async def create_session(session_in: SessionCreate, db: AsyncSession = Depends(get_db)):
@@ -94,7 +95,6 @@ async def chat_with_agent(session_id: str, chat_req: ChatRequest, db: AsyncSessi
             db.add(Message(session_id=session_id, role="user", content=combined_text))
             await db.flush()
 
-            # 🌟 还原功能：自动重命名逻辑
             history_stmt = select(Message).where(Message.session_id == session_id).order_by(Message.created_at.asc())
             history_records = (await db.execute(history_stmt)).scalars().all()
             if len(history_records) == 1 and (not session.title or "新会话" in session.title):
@@ -102,15 +102,13 @@ async def chat_with_agent(session_id: str, chat_req: ChatRequest, db: AsyncSessi
                     client = AsyncOpenAI(api_key=chat_req.api_key, base_url=chat_req.base_url)
                     resp = await client.chat.completions.create(
                         model=chat_req.text_model,
-                        messages=[
-                            {"role": "system", "content": "输出4到6个字标题，不要标点。"},
-                            {"role": "user", "content": f"根据内容生成标题：{chat_req.user_input}"}
-                        ]
+                        messages=[{"role": "system", "content": "输出4到6个字标题，不要标点。"},
+                                  {"role": "user", "content": f"根据内容生成标题：{chat_req.user_input}"}]
                     )
                     session.title = resp.choices[0].message.content.strip(' \n\r"“”。')
                     await db.commit()
                 except Exception as e:
-                    logger.error(f"Auto-rename failed: {e}")
+                    pass
 
     elif chat_req.action == "approve_tool":
         tool_instance = local_custom_tools.get(chat_req.pending_tool_name) or tool_registry.get_tool(
@@ -126,7 +124,6 @@ async def chat_with_agent(session_id: str, chat_req: ChatRequest, db: AsyncSessi
         db.add(Message(session_id=session_id, role="user", content="🚫 [系统汇报] 用户拒绝了命令。"))
         await db.flush()
     elif chat_req.action == "pull_local_model":
-        # 🌟 专用流式拉取管道
         async def pull_stream():
             try:
                 async with httpx.AsyncClient() as client:
@@ -138,16 +135,13 @@ async def chat_with_agent(session_id: str, chat_req: ChatRequest, db: AsyncSessi
                                 yield f"data: {json.dumps({'type': 'pull_progress', 'status': data.get('status', ''), 'completed': data.get('completed', 0), 'total': data.get('total', 1)})}\n\n"
                 yield f"data: {json.dumps({'type': 'pull_success'})}\n\n"
             except Exception as e:
-                yield f"data: {json.dumps({'type': 'error', 'content': f'Ollama 连接失败，请确保本地 Ollama 已启动！({str(e)})'})}\n\n"
+                yield f"data: {json.dumps({'type': 'error', 'content': f'Ollama 连接失败({str(e)})'})}\n\n"
 
         return StreamingResponse(pull_stream(), media_type="text/event-stream")
 
     async def event_generator():
         target_model = chat_req.text_model
 
-        # ==========================================
-        # 🕵️ 静默探测：如果是多模型协作，检查本地大脑是否存在
-        # ==========================================
         if chat_req.swarm_mode:
             has_local_model = False
             try:
@@ -159,18 +153,16 @@ async def chat_with_agent(session_id: str, chat_req: ChatRequest, db: AsyncSessi
                             m.get("name") == LOCAL_BRAIN_MODEL or m.get("name") == f"{LOCAL_BRAIN_MODEL}:latest" for m
                             in tags)
             except Exception:
-                pass  # Ollama未启动或连接失败，交由前端处理
-
+                pass
             if not has_local_model:
                 yield f"data: {json.dumps({'type': 'requires_local_model', 'model_name': LOCAL_BRAIN_MODEL})}\n\n"
-                return  # 🌟 核心：强制中断，交由前端弹窗
+                return
 
         history_stmt = select(Message).where(Message.session_id == session_id).order_by(Message.created_at.asc())
         history_records = (await db.execute(history_stmt)).scalars().all()
 
         llm_messages = []
-        if chat_req.system_prompt:
-            llm_messages.append({"role": "system", "content": chat_req.system_prompt})
+        if chat_req.system_prompt: llm_messages.append({"role": "system", "content": chat_req.system_prompt})
 
         for m in history_records:
             if m.role == "tool":
@@ -178,183 +170,169 @@ async def chat_with_agent(session_id: str, chat_req: ChatRequest, db: AsyncSessi
             else:
                 llm_messages.append({"role": m.role, "content": m.content})
 
-            # 🌟 追加当前用户的最新提问 (如果是带图片的，替换为多模态格式)
         current_msg = {"role": "user", "content": chat_req.user_input}
         if chat_req.action == "chat" and chat_req.image_base64:
             target_model = chat_req.vision_model or chat_req.text_model
-            current_msg["content"] = [
-                {"type": "text", "text": chat_req.user_input},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{chat_req.image_base64}"}}
-            ]
+            current_msg["content"] = [{"type": "text", "text": chat_req.user_input}, {"type": "image_url",
+                                                                                      "image_url": {
+                                                                                          "url": f"data:image/jpeg;base64,{chat_req.image_base64}"}}]
         llm_messages.append(current_msg)
-        # ==========================================
-        # 🗜️ 2. 本地小模型介入：无感记忆压缩器 (Context Compressor)
-        # ==========================================
-        # 当历史消息超过 8 条 (不包含系统提示和当前最新提问) 时，触发本地记忆压缩
+
         msgs_to_compress = [m for m in llm_messages[:-1] if m.get("role") != "system"]
-
         if len(msgs_to_compress) >= 8:
-            logger.info(
-                f"🗜️ [记忆压缩] 检测到历史记录过长 ({len(msgs_to_compress)}条)，正在唤醒本地模型 [{LOCAL_BRAIN_MODEL}]...")
-            yield f"data: {json.dumps({'type': 'status', 'content': f'🗜️ 历史记录达到 {len(msgs_to_compress)} 条，本地小模型正在压缩上下文记忆...'})}\n\n"
-
+            logger.info(f"🗜️ [记忆压缩] 唤醒本地模型 [{LOCAL_BRAIN_MODEL}]...")
+            yield f"data: {json.dumps({'type': 'status', 'content': f'🗜️ 历史记录达到 {len(msgs_to_compress)} 条，本地小模型正在压缩记忆...'})}\n\n"
             history_text = "\n".join([f"{m['role']}: {str(m['content'])[:500]}..." for m in msgs_to_compress])
             compress_prompt = "你是一个记忆压缩清道夫。请将以下冗长的多轮历史对话压缩成 300 字以内的精华摘要。必须保留用户的核心意图、关键的已知前提和代码片段。不要闲聊，直接输出摘要内容。"
-
             summary_res = ""
             try:
-                # 调用本地小模型进行压缩 (零成本)
                 async for ev in generate_ai_reply_stream(
                         [{"role": "user", "content": f"{compress_prompt}\n\n【待压缩历史记录】:\n{history_text}"}],
                         "ollama", "http://localhost:11434/v1", LOCAL_BRAIN_MODEL, False, None):
-                    if ev["type"] == "text_chunk":
-                        summary_res += ev["data"]
-
+                    if ev["type"] == "text_chunk": summary_res += ev["data"]
                 if summary_res.strip():
-                    logger.info(
-                        f"✅ [记忆压缩] 本地模型压缩完成！原长度: {len(history_text)} 字符 -> 压缩后: {len(summary_res)} 字符")
                     yield f"data: {json.dumps({'type': 'status', 'content': '✅ 记忆压缩完成，正在唤醒主脑计算当前问题...'})}\n\n"
-
-                    # 🌟 重构上下文：系统提示词 + 记忆摘要 + 最新问题
                     new_llm_messages = []
-                    if chat_req.system_prompt:
-                        new_llm_messages.append({"role": "system", "content": chat_req.system_prompt})
+                    if chat_req.system_prompt: new_llm_messages.append(
+                        {"role": "system", "content": chat_req.system_prompt})
                     new_llm_messages.append(
                         {"role": "system", "content": f"【💡 此前的历史对话已被压缩为摘要】:\n{summary_res}"})
-                    new_llm_messages.append(current_msg)  # 压入当前问题
-                    llm_messages = new_llm_messages  # 替换掉原来极其臃肿的 messages 列表
+                    new_llm_messages.append(current_msg)
+                    llm_messages = new_llm_messages
             except Exception as e:
-                logger.error(f"❌ [记忆压缩] 本地模型压缩失败: {str(e)}。已回退到完整历史记录模式。")
                 yield f"data: {json.dumps({'type': 'status', 'content': '⚠️ 本地记忆压缩未响应，回退使用完整历史记录...'})}\n\n"
-                # 如果失败，直接 catch 掉，不影响后续大模型的正常访问
-                pass
 
         # ==========================================
-        # 👑 智能体协作核心调度总线 (Swarm Orchestrator)
+        # 🚀 新增极客武器：使 Swarm 节点支持独立工具调用闭环！
         # ==========================================
+        async def run_node_with_tools(node: SwarmNode, msgs: list) -> str:
+            node_msgs = list(msgs)
+
+            # 🌟 核心映射：将传过来的工具名称列表，映射为真正的 OpenAI JSON Schema
+            node_schemas = []
+            assigned_names = getattr(node, "assigned_tools", []) or []
+            for t_name in assigned_names:
+                for schema in extra_schemas:  # extra_schemas 是路由最顶端已经解析好的全部工具
+                    if schema["function"]["name"] == t_name:
+                        node_schemas.append(schema)
+                        break
+
+            if not node_schemas: node_schemas = None
+            final_text = ""
+            for _ in range(5):  # 最多允许连续调用 5 次工具
+                current_text = ""
+                tool_calls_to_exec = None
+
+                async for ev in generate_ai_reply_stream(node_msgs, node.api_key, node.base_url, node.text_model,
+                                                         bool(node_schemas), node_schemas):
+                    if ev["type"] == "text_chunk":
+                        current_text += ev["data"]
+                    elif ev["type"] == "final_message":
+                        ai_msg = ev["data"]
+                        if ai_msg.tool_calls:
+                            tool_calls_to_exec = ai_msg.tool_calls
+                            node_msgs.append(ai_msg.model_dump(exclude_unset=True))
+                        else:
+                            current_text = ai_msg.content or current_text
+                #
+                if tool_calls_to_exec:
+                    for tc in tool_calls_to_exec:
+                        t_name = tc.function.name
+                        t_args = tc.function.arguments
+                        # 拦截测试用的虚拟时间工具
+                        logger.info(f"🛠️ [Swarm 工具调用] 节点正动用工具: [{t_name}] | 参数: {t_args}")
+                        if t_name == "get_system_time":
+                            from datetime import datetime
+                            t_res = f"系统执行成功，当前时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                        else:
+                            try:
+                                tool_inst = local_custom_tools.get(t_name) or tool_registry.get_tool(t_name)
+                                if tool_inst:
+                                    t_res = await tool_inst.execute(**json.loads(t_args))
+                                else:
+                                    t_res = f"无此工具: {t_name}"
+                            except Exception as e:
+                                t_res = f"执行报错: {str(e)}"
+                        logger.info(f"✅ [Swarm 工具返回] 结果截取: {str(t_res)[:100]}...")
+                        node_msgs.append({"role": "tool", "tool_call_id": tc.id, "name": t_name, "content": str(t_res)})
+                else:
+                    final_text = current_text
+                    break
+            return final_text
+
         if chat_req.swarm_mode and chat_req.swarm_nodes:
-            logger.info(
-                f"🚀 [Swarm] 启动协作网络 | 模式: {chat_req.swarm_mode} | 参战模型: {[n.text_model for n in chat_req.swarm_nodes]}")
-            # 🌟 核心新增：单模型自动降级为极速直连模式
             if len(chat_req.swarm_nodes) == 1:
                 yield f"data: {json.dumps({'type': 'status', 'content': '⚡ 仅检测到单模型，已自动降级为极速直连模式...'})}\n\n"
-                chat_req.swarm_mode = None  # 强行关闭 Swarm 模式，让它流转到最下方的普通单聊逻辑
+                chat_req.swarm_mode = None
             else:
-                yield f"data: {json.dumps({'type': 'status', 'content': '🚀 指令已接收，直接唤醒主脑舰队...'})}\n\n"
+                yield f"data: {json.dumps({'type': 'status', 'content': '🚀 指令已接收，正在编排异构舰队...'})}\n\n"
+
             # ------------------------------------------
             # ⚔️ 分支 A：主从迭代模式
             # ------------------------------------------
             if chat_req.swarm_mode == "maker_checker" and len(chat_req.swarm_nodes) > 1:
                 primary = chat_req.swarm_nodes[0]
-                critics = chat_req.swarm_nodes[1:]  # 🌟 纯净的云端副脑舰队，不再混入本地模型
-
-                yield f"data: {json.dumps({'type': 'status', 'content': f'🚀 启动主从迭代 | 主脑: {primary.provider_name}'})}\n\n"
-
-            # ------------------------------------------
-            # ⚔️ 分支 A：主从迭代模式
-            # ------------------------------------------
-            # ------------------------------------------
-            # ⚔️ 分支 A：主从迭代模式
-            # ------------------------------------------
-            if chat_req.swarm_mode == "maker_checker" and len(chat_req.swarm_nodes) > 1:
-                primary = chat_req.swarm_nodes[0]
-                critics = chat_req.swarm_nodes[1:]  # 🌟 纯净的云端副脑舰队，不再混入本地模型
+                critics = chat_req.swarm_nodes[1:]
 
                 yield f"data: {json.dumps({'type': 'status', 'content': f'🚀 启动主从迭代 | 主脑: {primary.provider_name}'})}\n\n"
 
                 current_messages = list(llm_messages)
                 final_draft = ""
 
-                for iteration in range(1, 4):  # 最大循环 3 次
-                    yield f"data: {json.dumps({'type': 'status', 'content': f'✍️ [第 {iteration} 轮] 主脑正在生成草稿...'})}\n\n"
+                for iteration in range(1, 4):
+                    yield f"data: {json.dumps({'type': 'status', 'content': f'✍️ [第 {iteration} 轮] 主脑正在动用专属能力撰写草稿...'})}\n\n"
+                    # 🌟 异构革新：主脑带着它的专属工具去写草稿！
+                    draft = await run_node_with_tools(primary, current_messages)
 
-                    draft = ""
-                    async for ev in generate_ai_reply_stream(current_messages, primary.api_key, primary.base_url,
-                                                                 primary.text_model, False, None):
-                        if ev["type"] == "text_chunk": draft += ev["data"]
+                    yield f"data: {json.dumps({'type': 'status', 'content': f'🕵️ {len(critics)} 位副脑正在并发严苛审查中...'})}\n\n"
 
-                    yield f"data: {json.dumps({'type': 'status', 'content': f'🕵️ {len(critics)} 位副脑(含本地中枢)正在并发审查中...'})}\n\n"
-
-                    # 并发执行副模型打分
                     tasks = []
                     for c in critics:
                         sys_prompt = """你是一个冷酷无情、极其严苛的 AI 首席审查官 (Judge)。
-        你的任务是评估【待审草稿】是否完美解答了【用户问题】。
-
-        请你严格按照以下【评分量表】给出 0-100 的整数评分：
-        - [90-100分]：无懈可击。事实绝对正确，逻辑严密，排版优雅，代码/方案可直接投入生产环境。
-        - [80-89分]：合格但平庸。大方向正确，但缺少深度、遗漏了次要细节、或者表达不够清晰。
-        - [60-79分]：必须重写。存在明显的逻辑漏洞、部分事实错误、代码存在 Bug 或严重偏题。
-        - [0-59分]：灾难性错误。严重的幻觉、产生危险后果、或者完全没有回答用户的问题。
-
-        扣分规则：
-        1. 只要发现任何一处常识性错误或代码语法错误，分数不得高于 75 分。
-        2. 如果草稿遗漏了用户提问中的任何一个限定条件，分数不得高于 80 分。
-
-        在决定分数前，请先深吸一口气，一步一步地审查草稿的事实、逻辑和完整性。"""
+你的任务是评估【待审草稿】是否完美解答了【用户问题】。
+请你严格按照以下【评分量表】给出 0-100 的整数评分：
+- [90-100分]：无懈可击。事实绝对正确，逻辑严密。
+- [80-89分]：合格但平庸。大方向正确，但缺少深度或遗漏细节。
+- [60-79分]：必须重写。存在明显逻辑漏洞、事实错误。
+- [0-59分]：灾难性错误。严重幻觉、完全偏题。"""
                         tasks.append(generate_json_evaluation(sys_prompt,
-                                                                  f"用户问题: {chat_req.user_input}\n\n待审草稿:\n{draft}",
-                                                                  c.api_key, c.base_url, c.text_model))
+                                                              f"用户问题: {chat_req.user_input}\n\n待审草稿:\n{draft}",
+                                                              c.api_key, c.base_url, c.text_model))
 
                     eval_results = await asyncio.gather(*tasks, return_exceptions=True)
-
-                    all_pass = True
-                    advices = []
-                    total_score = 0
-                    valid_score_count = 0
-
-                    # 🌟 专门用于收集发给前端用户的“打分卡详情”
-                    critic_details = []
+                    all_pass, advices, total_score, valid_score_count, critic_details = True, [], 0, 0, []
 
                     for idx, res in enumerate(eval_results):
-                        c_name = critics[idx].provider_name  # 获取对应的副模型名字
+                        c_name = critics[idx].provider_name
                         if isinstance(res, dict):
-                            is_pass = res.get("pass", True)
-                            score = res.get("score", 0)
-                            advice = res.get("advice", "完美解答，无修改意见。")
-
+                            is_pass, score, advice = res.get("pass", True), res.get("score", 0), res.get("advice",
+                                                                                                         "无修改意见。")
                             if not is_pass: all_pass = False
-                            if advice and advice.strip(): advices.append(f"[{c_name} 的建议]: {advice}")
-                            if "score" in res and isinstance(res["score"], (int, float)):
-                                total_score += res["score"]
+                            if advice.strip(): advices.append(f"[{c_name}]: {advice}")
+                            if "score" in res and isinstance(score, (int, float)):
+                                total_score += score
                                 valid_score_count += 1
-
-                            # 将每个评委的打分和评语记录下来
                             critic_details.append(f"> - **{c_name}**: 评分 `{score}/100`。*评价: {advice}*")
 
                     avg_score = (total_score / valid_score_count) if valid_score_count > 0 else 0
 
-                    # 🌟 判断是否进入终局
                     if all_pass or avg_score >= 85 or iteration == 3:
-                        if iteration == 3 and not all_pass and avg_score < 85:
-                            yield f"data: {json.dumps({'type': 'status', 'content': f'⚠️ 达到最大重试次数 (平均分 {avg_score:.1f})'})}\n\n"
-                        else:
-                            yield f"data: {json.dumps({'type': 'status', 'content': f'✅ 审查通过 (平均分 {avg_score:.1f})'})}\n\n"
-
-                        # 🌟 构建极其优雅的 Markdown 评审报告
-                        review_summary = f"> 📊 **多智能体委员会 - 最终评审报告 (综合得分: {avg_score:.1f})**\n>\n"
-                        for detail in critic_details:
-                            review_summary += f"{detail}\n>\n"
+                        yield f"data: {json.dumps({'type': 'status', 'content': f'✅ 审查结束 (综合得分 {avg_score:.1f})'})}\n\n"
+                        review_summary = f"> 📊 **多智能体委员会 - 最终评审报告 (得分: {avg_score:.1f})**\n>\n"
+                        for detail in critic_details: review_summary += f"{detail}\n>\n"
                         review_summary += "> ---\n\n"
-
-                        # 🌟 核心修复：直接把报告拼接在终稿的最前面！
-                        # 这样它不仅能一次性丝滑地流式渲染给前端，还会被完美保存在数据库的历史记录里！
                         final_draft = review_summary + draft
                         break
-
-                    # 🌟 未通过：收集建议打回重做
                     else:
-                        yield f"data: {json.dumps({'type': 'status', 'content': f'⚠️ 评分仅为 {avg_score:.1f}，正在根据专家意见重写...'})}\n\n"
-                        advice_str = "\n".join(advices)
-                        current_messages.append({"role": "assistant", "content": draft})
-                        current_messages.append({"role": "user",
-                                                 "content": f"你的回答未通过审查（综合得分：{avg_score:.1f}）。请严格根据以下专家的批评建议进行彻底重写：\n{advice_str}"})
+                        yield f"data: {json.dumps({'type': 'status', 'content': f'⚠️ 评分 {avg_score:.1f}，打回重写...'})}\n\n"
+                        current_messages.extend([{"role": "assistant", "content": draft}, {"role": "user",
+                                                                                           "content": f"审查未通过（得分：{avg_score:.1f}）。请彻底重写：\n" + "\n".join(
+                                                                                               advices)}])
 
-                # 将最终结果以流的形式平滑展示给用户
                 chunk_size = 10
                 for i in range(0, len(final_draft), chunk_size):
                     yield f"data: {json.dumps({'type': 'chunk', 'content': final_draft[i:i + chunk_size]})}\n\n"
-                    await asyncio.sleep(0.02)
+                    await asyncio.sleep(0.01)
 
                 db.add(Message(session_id=session_id, role="assistant", content=final_draft))
                 await db.commit()
@@ -362,99 +340,71 @@ async def chat_with_agent(session_id: str, chat_req: ChatRequest, db: AsyncSessi
                 return
 
             # ------------------------------------------
-            # ⚔️ 分支 B：圆桌会议模式
-            # ------------------------------------------
-            # ------------------------------------------
-            # ⚔️ 分支 B：圆桌会议模式 (Map-Reduce 融合算法)
+            # ⚔️ 分支 B：圆桌会议模式 (异构 Map-Reduce)
             # ------------------------------------------
             elif chat_req.swarm_mode == "roundtable" and len(chat_req.swarm_nodes) > 0:
                 participants = list(chat_req.swarm_nodes)
-                judge = participants[0]  # 🌟 核心：用户勾选的第一个模型作为首席主脑 (Judge)
+                judge = participants[0]
 
-                yield f"data: {json.dumps({'type': 'status', 'content': f'🎪 启动圆桌会议 | {len(participants)} 位专家并发思考中...'})}\n\n"
+                yield f"data: {json.dumps({'type': 'status', 'content': f'🎪 启动异构圆桌会议 | {len(participants)} 位专家正在利用专属工具并发思考...'})}\n\n"
 
-                # ==========================================
-                # 🗺️ 阶段 1：Map (并发映射) - 获取所有专家的独立观点
-                # ==========================================
                 async def get_node_answer(n):
-                    ans = ""
-                    # 专家们在后台默默思考，不向前端推流，避免画面混乱
-                    async for ev in generate_ai_reply_stream(llm_messages, n.api_key, n.base_url, n.text_model, False,
-                                                             None):
-                        if ev["type"] == "text_chunk":
-                            ans += ev["data"]
+                    # 🌟 异构革新：每个专家带着自己的专属工具独立调研！
+                    ans = await run_node_with_tools(n, llm_messages)
                     return f"【{n.provider_name} 的独立见解】:\n{ans}\n"
 
-                # 并发执行，收集答案
                 tasks = [get_node_answer(node) for node in participants]
                 answers = await asyncio.gather(*tasks, return_exceptions=True)
-
-                # 过滤掉网络超时或报错的结果，保证主脑不被报错信息污染
                 valid_answers = [a for a in answers if isinstance(a, str) and a.strip()]
 
-                yield f"data: {json.dumps({'type': 'status', 'content': f'⚖️ 意见收集完毕 ({len(valid_answers)}/{len(participants)} 成功)，首席法官 [{judge.provider_name}] 正在进行降维融合...'})}\n\n"
+                yield f"data: {json.dumps({'type': 'status', 'content': f'⚖️ 数据收集完毕，首席法官 [{judge.provider_name}] 正在进行跨模态降维融合...'})}\n\n"
 
-                # ==========================================
-                # 🗜️ 阶段 2：Reduce (归约) & Resolution (裁决)
-                # ==========================================
-                # 强迫主脑使用 Zero-Shot CoT (思维链) 进行结构化信息降维
                 synthesis_prompt = f"""你是本次多智能体圆桌会议的首席法官(Judge)。
-        【重要业务背景】：用户当前期望回答者扮演以下角色/遵循以下规则：“{chat_req.system_prompt}”。请你在裁决时，也将此规则纳入考量。
-        针对用户的问题，以下是各位专家的独立解答：
-        ====================
-        {chr(10).join(valid_answers)}
-        ====================
-    
-        请你运用 Map-Reduce 融合算法，严格按照以下 Markdown 格式进行思考和输出：
-    
-        > 🎪 **多智能体圆桌会议 - 首席法官综合纪要**
-        > 
-        > **🟢 核心共识**：
-        > (高度提炼所有专家达成一致的关键事实或方案)
-        > 
-        > **🔴 关键分歧 / 独到见解**：
-        > (指出专家们意见冲突的地方，或者某位专家提出的独特盲区)
-        > 
-        > **⚖️ 法官裁决**：
-        > (针对上述分歧，给出你的最终专业判断及取舍理由)
-    
-        ---
-    
-        (在此处输出你融合各方智慧后的【最终完美解答】，直接回答用户问题，不要再写多余的客套话)
-        """
-                # 构造主脑的 messages：系统提示词 (包含所有专家意见) + 用户的原始问题
-                judge_messages = [
-                    {"role": "system", "content": synthesis_prompt},
-                    {"role": "user", "content": chat_req.user_input}
-                ]
+【业务背景】：用户期望遵循规则：“{chat_req.system_prompt}”。请纳入考量。
+以下是各位专家的独立调研报告（部分专家可能调用了特定的系统 API 获取了真实数据）：
+====================
+{chr(10).join(valid_answers)}
+====================
 
+请运用 Map-Reduce 融合算法，严格按以下 Markdown 格式输出：
+> 🎪 **多智能体圆桌会议 - 首席法官综合纪要**
+> 
+> **🟢 核心共识 / 确凿事实**：
+> (提炼共识，若某专家通过工具获取了真实数据，请将其作为确凿事实)
+> 
+> **🔴 关键分歧 / 独到见解**：
+> (指出冲突或信息差)
+> 
+> **⚖️ 法官裁决**：
+> (给出最终专业判断)
+
+---
+(在此处输出融合后的最终完美解答)
+"""
+                judge_messages = [{"role": "system", "content": synthesis_prompt},
+                                  {"role": "user", "content": chat_req.user_input}]
                 full_response = ""
-
-                # 🌟 主脑开始流式输出《综合纪要》和《最终答案》
                 async for event in generate_ai_reply_stream(judge_messages, judge.api_key, judge.base_url,
                                                             judge.text_model, False, None):
                     if event["type"] == "text_chunk":
                         full_response += event["data"]
                         yield f"data: {json.dumps({'type': 'chunk', 'content': event['data']})}\n\n"
 
-                # 保存最终结果入库 (纪要和答案会被一并保存为历史记忆)
                 db.add(Message(session_id=session_id, role="assistant", content=full_response))
                 await db.commit()
                 yield f"data: {json.dumps({'type': 'completed', 'content': full_response})}\n\n"
                 return
 
         # ==========================================
-        # 🚶 普通模式 (Single Agent)
+        # 🚶 普通单机模式
         # ==========================================
         for iteration in range(3):
-            # ... (这部分保持原有的普通单聊逻辑，调用 generate_ai_reply_stream 处理 tool calls 等) ...
             async for event in generate_ai_reply_stream(llm_messages, chat_req.api_key, chat_req.base_url, target_model,
                                                         True, extra_schemas):
                 if event["type"] == "text_chunk":
                     yield f"data: {json.dumps({'type': 'chunk', 'content': event['data']})}\n\n"
                 elif event["type"] == "error":
-                    yield f"data: {json.dumps({'type': 'error', 'content': event['data']})}\n\n"
-                    return
+                    yield f"data: {json.dumps({'type': 'error', 'content': event['data']})}\n\n"; return
                 elif event["type"] == "final_message":
                     ai_message = event["data"]
                     if ai_message.tool_calls:
@@ -468,25 +418,16 @@ async def chat_with_agent(session_id: str, chat_req: ChatRequest, db: AsyncSessi
                             t_name = tool_call.function.name
                             t_args_str = tool_call.function.arguments
 
-                            if t_name == "execute_local_terminal_command":
+                            # 拦截测试用时间工具
+                            if t_name == "get_system_time":
+                                from datetime import datetime
+                                t_result = f"当前系统时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                            else:
                                 try:
-                                    cmd_to_run = json.loads(t_args_str).get("command", "").strip()
-                                except:
-                                    cmd_to_run = ""
-                                SAFE = ("ls", "cat", "pwd", "echo", "whoami", "date", "which")
-                                DANGER = ("&&", ";", "|", ">", "<", "`", "$")
-                                is_safe = any(cmd_to_run.startswith(p) for p in SAFE) and not any(
-                                    c in cmd_to_run for c in DANGER)
-                                if not is_safe:
-                                    await db.commit()
-                                    yield f"data: {json.dumps({'type': 'requires_action', 'name': t_name, 'args': t_args_str})}\n\n"
-                                    return
-
-                            try:
-                                tool_instance = local_custom_tools.get(t_name) or tool_registry.get_tool(t_name)
-                                t_result = await tool_instance.execute(**json.loads(t_args_str))
-                            except Exception as e:
-                                t_result = f"Error: {str(e)}"
+                                    tool_instance = local_custom_tools.get(t_name) or tool_registry.get_tool(t_name)
+                                    t_result = await tool_instance.execute(**json.loads(t_args_str))
+                                except Exception as e:
+                                    t_result = f"Error: {str(e)}"
                             db.add(Message(session_id=session_id, role="user",
                                            content=f"🔧 [系统汇报: 工具执行结果]\n{t_result}"))
                             await db.flush()
@@ -494,8 +435,7 @@ async def chat_with_agent(session_id: str, chat_req: ChatRequest, db: AsyncSessi
                                                  "content": str(t_result)})
                         break
                     else:
-                        ai_msg_obj = Message(session_id=session_id, role="assistant", content=ai_message.content)
-                        db.add(ai_msg_obj)
+                        db.add(Message(session_id=session_id, role="assistant", content=ai_message.content))
                         await db.commit()
                         yield f"data: {json.dumps({'type': 'completed', 'content': ai_message.content})}\n\n"
                         return

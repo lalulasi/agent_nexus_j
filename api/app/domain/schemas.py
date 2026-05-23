@@ -35,6 +35,8 @@ class SwarmNode(BaseModel):
     api_key: str
     base_url: str
     text_model: str
+    # 🌟 新增：专属工具箱
+    assigned_tools: Optional[List[str]] = []  # 🌟 修复：改为字符串列表，只传工具名称，极简轻量！
 
 class ChatRequest(BaseModel):
     user_input: Optional[str] = None

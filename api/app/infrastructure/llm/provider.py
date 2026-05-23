@@ -1,10 +1,13 @@
+import json
+import re
+import httpx
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionMessage
 from openai.types.chat.chat_completion_message_tool_call import ChatCompletionMessageToolCall, Function
 from typing import List, Dict, Any, Optional, AsyncGenerator
 from app.core.logger import logger
 from app.infrastructure.tools.registry import tool_registry
-import json
+
 
 async def generate_ai_reply_stream(
         messages_history: List[Dict[str, Any]],
@@ -15,16 +18,13 @@ async def generate_ai_reply_stream(
         extra_tool_schemas: Optional[List[Dict[str, Any]]] = None
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """
-    支持流式输出 (Streaming) 的增强版 LLM 引擎。
-    智能分离普通文本流与工具调用流。
+    🌟 终极增强版 LLM 引擎 (Raw HTTP Streaming)
+    完全绕过 SDK 拦截，完美支持 DeepSeek 家族及 R1 推理过程的双向传输。
     """
     if not all([api_key, base_url, model_name]):
         logger.error("Incomplete LLM configuration.")
-        yield {"type": "error",
-               "data": "🚨 配置不完整：请检查侧边栏，确保当前模型的 API Key、Base URL 和 文本模型名称均已填写！"}
+        yield {"type": "error", "data": "🚨 配置不完整：请检查参数。"}
         return
-
-    client = AsyncOpenAI(api_key=api_key, base_url=base_url)
 
     final_tools = []
     if enable_tools:
@@ -32,75 +32,164 @@ async def generate_ai_reply_stream(
         if extra_tool_schemas:
             final_tools.extend(extra_tool_schemas)
 
-    logger.debug(f"Calling LLM Stream | Model: {model_name} | Tools: {len(final_tools)}")
+    # ==========================================
+    # 🧠 API 兼容层：精准判定是否需要 reasoning_content
+    # ==========================================
+    # 🌟 破案关键点：加入了 'deepseek'，只要碰到 DeepSeek 接口一律免疫 400 错误！
+    is_r1_family = any(k in model_name.lower() or k in (base_url or "").lower() for k in
+                       ["r1", "reasoner", "think", "deepseek", "dashscope", "volces"])
+
+    adapted_messages = []
+    for msg in messages_history:
+        new_msg = dict(msg)
+        if new_msg.get("role") == "assistant":
+            content = str(new_msg.get("content") or "")
+
+            # 1. 若历史记录中有思考过程，精准剥离
+            if "<think>" in content and "</think>" in content:
+                think_match = re.search(r"<think>(.*?)</think>", content, re.DOTALL)
+                if think_match:
+                    clean_content = re.sub(r"💭 \*\*思考过程:\*\*\n<think>.*?</think>\n\n---\n\n", "", content,
+                                           flags=re.DOTALL)
+                    clean_content = re.sub(r"💭 \*\*思考过程:\*\*\n<think>.*?</think>", "", clean_content,
+                                           flags=re.DOTALL)
+                    clean_content = re.sub(r"<think>.*?</think>", "", clean_content, flags=re.DOTALL).strip()
+
+                    new_msg["content"] = clean_content
+                    if is_r1_family:
+                        new_msg["reasoning_content"] = think_match.group(1).strip()
+            else:
+                # 2. 如果是深思家族但历史没思考，强塞空字符串满足 API 的变态校验
+                if is_r1_family:
+                    new_msg["reasoning_content"] = ""
+
+            # 3. 防御性清洗 (防止无 content 无 tool_calls 导致大模型内部异常崩溃)
+            if not new_msg.get("content") and not new_msg.get("tool_calls"):
+                new_msg["content"] = "(无文本输出)"
+
+        # 普通大模型（如 GPT-4 / Qwen）严禁携带推理字段
+        if not is_r1_family:
+            new_msg.pop("reasoning_content", None)
+
+        adapted_messages.append(new_msg)
+
+    # ==========================================
+    # 🚀 降维打击：直接使用底层 HTTP 发送请求
+    # ==========================================
+    request_payload = {
+        "model": model_name,
+        "messages": adapted_messages,
+        "temperature": 0.7,
+        "stream": True
+    }
+    if final_tools:
+        request_payload["tools"] = final_tools
+        request_payload["tool_choice"] = "auto"
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    endpoint = f"{base_url.rstrip('/')}/chat/completions"
+
+    tool_calls_buffer = {}
+    content_buffer = []
+    is_thinking = False
 
     try:
-        request_params = {
-            "model": model_name,
-            "messages": messages_history,
-            "temperature": 0.7,
-            "max_tokens": 2000,
-            "stream": True  # 🌟 开启底层流式传输
-        }
+        async with httpx.AsyncClient() as http_client:
+            async with http_client.stream("POST", endpoint, headers=headers, json=request_payload,
+                                          timeout=120.0) as response:
+                if response.status_code != 200:
+                    error_text = await response.aread()
+                    logger.error(f"❌ [请求崩溃] HTTP {response.status_code} | 云端返回: {error_text.decode('utf-8')}")
+                    raise Exception(f"HTTP {response.status_code}: {error_text.decode('utf-8')}")
 
-        if final_tools:
-            request_params["tools"] = final_tools
-            request_params["tool_choice"] = "auto"
+                # 实时解析 SSE 流
+                async for line in response.aiter_lines():
+                    line = line.strip()
+                    if not line or not line.startswith("data: "):
+                        continue
+                    if line == "data: [DONE]":
+                        break
 
-        response = await client.chat.completions.create(**request_params)
+                    try:
+                        chunk = json.loads(line[6:])
+                    except json.JSONDecodeError:
+                        continue
 
-        # 🌟 工具调用的碎片缓冲池
-        tool_calls_buffer = {}
-        content_buffer = []
+                    if not chunk.get("choices"):
+                        continue
 
-        async for chunk in response:
-            if not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta
+                    delta = chunk["choices"][0].get("delta", {})
 
-            # 1. 如果是人类可读的文本碎片，直接抛出给前端渲染！
-            if delta.content:
-                content_buffer.append(delta.content)
-                yield {"type": "text_chunk", "data": delta.content}
+                    # 🧠 1. 解析思考流 (Reasoning Content)
+                    reasoning = delta.get("reasoning_content")
+                    if reasoning:
+                        if not is_thinking:
+                            is_thinking = True
+                            start_tag = "💭 **思考过程:**\n<think>\n"
+                            content_buffer.append(start_tag)
+                            yield {"type": "text_chunk", "data": start_tag}
 
-            # 2. 如果是工具调用的 JSON 碎片，拦截并放入缓冲池拼接，不让前端看到
-            if delta.tool_calls:
-                for tc_chunk in delta.tool_calls:
-                    idx = tc_chunk.index
-                    if idx not in tool_calls_buffer:
-                        tool_calls_buffer[idx] = {
-                            "id": tc_chunk.id,
-                            "type": "function",
-                            "function": {"name": tc_chunk.function.name or "", "arguments": ""}
-                        }
-                    if tc_chunk.function.arguments:
-                        tool_calls_buffer[idx]["function"]["arguments"] += tc_chunk.function.arguments
+                        content_buffer.append(reasoning)
+                        yield {"type": "text_chunk", "data": reasoning}
 
-        # 3. 流式传输结束。如果有拼装好的工具调用，还原成原生对象抛出
+                    # 📝 2. 解析普通文本流 (Content)
+                    delta_content = delta.get("content")
+                    if delta_content:
+                        if is_thinking:
+                            is_thinking = False
+                            end_tag = "\n</think>\n\n---\n\n"
+                            content_buffer.append(end_tag)
+                            yield {"type": "text_chunk", "data": end_tag}
+
+                        content_buffer.append(delta_content)
+                        yield {"type": "text_chunk", "data": delta_content}
+
+                    # 🔧 3. 解析工具调用流 (Tool Calls)
+                    tcs = delta.get("tool_calls")
+                    if tcs:
+                        for tc_chunk in tcs:
+                            idx = tc_chunk.get("index")
+                            if idx not in tool_calls_buffer:
+                                tool_calls_buffer[idx] = {
+                                    "id": tc_chunk.get("id"),
+                                    "type": "function",
+                                    "function": {"name": tc_chunk.get("function", {}).get("name", ""), "arguments": ""}
+                                }
+                            args = tc_chunk.get("function", {}).get("arguments")
+                            if args:
+                                tool_calls_buffer[idx]["function"]["arguments"] += args
+
+        # 流式传输结束，安全兜底闭合思考标签
+        if is_thinking:
+            end_tag = "\n</think>\n\n---\n\n"
+            content_buffer.append(end_tag)
+            yield {"type": "text_chunk", "data": end_tag}
+
+        # 4. 组装最终结果返回给后端调度中心
         final_tool_calls = []
         if tool_calls_buffer:
             for idx, tc in sorted(tool_calls_buffer.items()):
                 final_tool_calls.append(
                     ChatCompletionMessageToolCall(
-                        id=tc["id"],
+                        id=tc["id"] or "call_id_unknown",
                         type="function",
                         function=Function(name=tc["function"]["name"], arguments=tc["function"]["arguments"])
                     )
                 )
 
-        # 构造最终的完整 Message 对象，为了兼容我们现有的 Agent 循环架构
         final_message = ChatCompletionMessage(
             role="assistant",
             content="".join(content_buffer) if content_buffer else None,
             tool_calls=final_tool_calls if final_tool_calls else None
         )
-
-        # 抛出最终的完整消息对象，供后端存数据库和执行工具
         yield {"type": "final_message", "data": final_message}
 
     except Exception as e:
-        logger.error(f"LLM Stream Error: {str(e)}")
-        yield {"type": "error", "data": f"Provider Error: {str(e)}"}
+        logger.error(f"LLM Raw Stream Error: {str(e)}")
+        yield {"type": "error", "data": f"底座模型响应失败: {str(e)}"}
 
 
 async def generate_json_evaluation(
@@ -110,23 +199,16 @@ async def generate_json_evaluation(
         base_url: str,
         model_name: str
 ) -> dict:
-    """
-    专门用于 Multi-Agent 协作的后台裁判引擎。
-    强制大模型返回结构化的 JSON 数据，以便 Python 代码进行算术逻辑判断。
-    """
-    # 🌟 新增：出征日志！
-    logger.info(f"🔍 [Swarm 审查] 唤醒副脑模型: [{model_name}] 开始进行逻辑打分...")
-
+    """专门用于 Multi-Agent 协作的后台裁判引擎"""
+    logger.info(f"🔍 [Swarm 审查] 唤醒模型: [{model_name}] 进行逻辑打分...")
     client = AsyncOpenAI(api_key=api_key, base_url=base_url)
 
-    # 强制大模型必须遵守的 JSON 格式约定
     json_instruction = """
-        你必须以纯 JSON 格式响应。JSON 必须严格包含以下三个字段：
-        - "pass": 布尔值 (true 或 false)，表示你是否认可该回答。
-        - "score": 整数 (0-100)，表示该回答的质量得分。
-        - "advice": 字符串。请详细写出你的评价理由。如果不通过，指出修改建议；如果通过，指出它的优点，绝对不能为空！
-        """
-
+    你必须以纯 JSON 格式响应。JSON 必须严格包含以下三个字段：
+    - "pass": 布尔值 (true 或 false)。
+    - "score": 整数 (0-100)。
+    - "advice": 字符串。请详细写出评价理由，绝对不能为空！
+    """
     messages = [
         {"role": "system", "content": f"{system_prompt}\n\n{json_instruction}"},
         {"role": "user", "content": user_prompt}
@@ -136,14 +218,12 @@ async def generate_json_evaluation(
         response = await client.chat.completions.create(
             model=model_name,
             messages=messages,
-            temperature=0.1,  # 🌟 调低温度，让 JSON 输出更稳定
+            temperature=0.1,
             response_format={"type": "json_object"}
         )
-
         result_str = response.choices[0].message.content or ""
         result_str = result_str.strip()
 
-        # 🌟 强力剥离：使用 chr(96) 动态生成反引号，完美避开聊天界面的渲染 Bug！
         bt = chr(96) * 3
         if result_str.startswith(f"{bt}json\n"):
             result_str = result_str[8:]
@@ -154,19 +234,13 @@ async def generate_json_evaluation(
         if result_str.endswith(bt): result_str = result_str[:-3]
 
         result_str = result_str.strip()
-        # ... (上面是强力剥离反引号的代码) ...
-        if not result_str:
-            raise ValueError("大模型返回了空字符串")
+        if not result_str: raise ValueError("大模型返回了空字符串")
 
-        # 🌟 优化日志：解析完成后，立刻在后台打印打分结果！
         result_dict = json.loads(result_str)
         logger.info(
-            f"📊 [Swarm 审查完成] 模型 [{model_name}] | 分数: {result_dict.get('score')} | 意见: {result_dict.get('advice', '无')[:50]}...")
-
+            f"📊 [审查完成] {model_name} | 分数: {result_dict.get('score')} | 意见: {result_dict.get('advice', '无')[:30]}...")
         return result_dict
 
     except Exception as e:
-    # 🌟 优化日志：明确打出是哪个 Model 崩溃了，方便精准溯源！
-        logger.error(
-            f"❌ [Swarm 报错] 模型 [{model_name}] 审查失败！Error: {str(e)} | Raw: {result_str if 'result_str' in locals() else 'None'}")
+        logger.error(f"❌ [审查报错] 模型 [{model_name}] JSON解析失败: {str(e)}")
         return {"pass": True, "score": 60, "advice": f"({model_name} 审查异常，自动放行)"}
