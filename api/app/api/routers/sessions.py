@@ -25,15 +25,22 @@ async def list_sessions(db: DB, limit: int = 50, offset: int = 0):
 
 @router.post("/", response_model=SessionOut, status_code=status.HTTP_201_CREATED)
 async def create_session(payload: SessionCreate, db: DB):
+    if payload.collab_mode and payload.collab_mode not in ("round_table", "master_slave"):
+        raise HTTPException(status_code=400, detail="collab_mode 必须是 round_table 或 master_slave")
+
     session = AgentSession(
         title=payload.title,
         system_prompt_id=payload.system_prompt_id,
         meta=payload.meta,
+        collab_mode=payload.collab_mode,
+        collab_config=payload.collab_config,
     )
     db.add(session)
     await db.flush()
     await db.refresh(session)
-    logger.info(f"创建会话 {session.id}，System Prompt: {session.system_prompt_id}")
+    logger.info(
+        f"创建会话 {session.id}，collab_mode={session.collab_mode}，SP={session.system_prompt_id}"
+    )
     return session
 
 

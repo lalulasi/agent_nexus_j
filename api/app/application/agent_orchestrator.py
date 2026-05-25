@@ -197,14 +197,17 @@ class AgentOrchestrator:
             naming_adapter = make_adapter(adapter.config, [])
             msgs = naming_adapter.format_history([{
                 "role": "user",
-                "content": (
-                    "根据下面这条用户消息，为对话生成一个简洁的中文标题。"
-                    "要求：10字以内，只输出标题文字本身，不加引号、标点或任何解释。\n\n"
-                    + user_message[:300]
-                ),
+                "content": "为以下对话内容生成一个中文标题，10字以内：\n\n" + user_message[:300],
             }])
-            turn = await naming_adapter.complete(msgs, None, 30)
-            title = turn.text.strip().strip("\"'《》「」【】<>").strip()[:30]
+            _naming_system = "只输出标题本身，不超过10个字，不加任何解释或前缀。"
+            title_text = ""
+            async for item in naming_adapter.stream(msgs, _naming_system, 100):
+                if isinstance(item, str):
+                    title_text += item
+            title = title_text.strip().strip("\"'《》「」【】<>、。，").strip()[:20]
+            # 兜底：模型未输出有效内容时取用户消息前10字
+            if not title:
+                title = user_message.strip()[:10]
             if title:
                 session.title = title
                 await self.db.flush()

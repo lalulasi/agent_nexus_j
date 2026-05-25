@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.app.application.agent_orchestrator import AgentOrchestrator
+from api.app.application.collaboration_orchestrator import CollaborationOrchestrator
 from api.app.domain.schemas import ChatRequest, ChatResponse
 from api.app.infrastructure.database.models import AgentSession, LLMConfig
 from api.app.infrastructure.database.session import get_db
@@ -23,6 +24,9 @@ async def chat(payload: ChatRequest, db: DB):
     if not session:
         raise HTTPException(status_code=404, detail="会话不存在")
 
+    if session.collab_mode:
+        raise HTTPException(status_code=400, detail="协作会话请使用流式接口 /chat/stream")
+
     orchestrator = AgentOrchestrator(db)
     return await orchestrator.run(session, payload.message)
 
@@ -33,7 +37,26 @@ async def chat_stream(payload: ChatRequest, db: DB):
     if not session:
         raise HTTPException(status_code=404, detail="会话不存在")
 
-    # 提前加载激活配置，失败时返回明确的 HTTP 错误（而非在流中途报错）
+    # ── 协作模式：路由到 CollaborationOrchestrator ─────────────────────────────
+    if session.collab_mode:
+        collab = CollaborationOrchestrator(db)
+
+        async def collab_event_stream():
+            try:
+                async for chunk in collab.stream_run(session, payload.message):
+                    yield f"data: {chunk}\n\n"
+            except Exception as e:
+                yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+            finally:
+                yield "data: [DONE]\n\n"
+
+        return StreamingResponse(
+            collab_event_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    # ── 普通模式 ───────────────────────────────────────────────────────────────
     result = await db.execute(select(LLMConfig).where(LLMConfig.is_active == True))
     config = result.scalar_one_or_none()
     if not config:
@@ -53,8 +76,5 @@ async def chat_stream(payload: ChatRequest, db: DB):
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",  # 禁止 Nginx 缓冲，确保实时推送
-        },
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

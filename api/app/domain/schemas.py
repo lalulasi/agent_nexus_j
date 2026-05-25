@@ -98,6 +98,8 @@ class SessionCreate(BaseModel):
     title: str = "新会话"
     system_prompt_id: uuid.UUID | None = None
     meta: dict | None = None
+    collab_mode: str | None = None
+    collab_config: dict | None = None
 
 
 class SessionUpdate(BaseModel):
@@ -123,6 +125,8 @@ class SessionOut(BaseModel):
     model: str
     status: str
     meta: dict | None
+    collab_mode: str | None = None
+    collab_config: dict | None = None
     created_at: datetime
     updated_at: datetime
     messages: list[MessageOut] = Field(default_factory=list)
@@ -168,6 +172,25 @@ class UserToolOut(BaseModel):
     updated_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+# ── Collaboration ─────────────────────────────────────────────────────────────
+
+class CollabModelSlot(BaseModel):
+    """圆桌模式的模型槽位：指定模型配置 ID 和角色。"""
+    config_id: uuid.UUID
+    role: str  # proposer | critic | creative | validator | synthesizer
+
+
+class CollabConfigIn(BaseModel):
+    """创建协作会话时传入的配置。"""
+    mode: str  # "round_table" | "master_slave"
+    rounds: int = Field(default=2, ge=1, le=3)
+    # 圆桌模式：按顺序列出所有槽位（最后一个必须是 synthesizer）
+    models: list[CollabModelSlot] = Field(default_factory=list)
+    # 主从模式
+    master_config_id: uuid.UUID | None = None
+    reviewer_config_ids: list[uuid.UUID] = Field(default_factory=list)
 
 
 # ── Chat ──────────────────────────────────────────────────────────────────────

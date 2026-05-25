@@ -87,7 +87,8 @@ def _apply_theme() -> None:
     检查当前时间，将 config.toml 设置为对应主题。
     若配置与目标不符，更新文件后触发浏览器刷新（由 Streamlit 原生主题接管）。
     """
-    desired = "dark" if datetime.now().hour >= 18 else "light"
+    hour = datetime.now().hour
+    desired = "dark" if hour >= 18 or hour < 6 else "light"
     try:
         current = _CONFIG_PATH.read_text(encoding="utf-8")
     except OSError:
@@ -139,7 +140,7 @@ def api(method: str, path: str, silent: bool = False, **kwargs):
 
 
 def stream_chat(session_id: str, message: str):
-    """同步生成器，供 st.write_stream() 消费。"""
+    """同步生成器，供 st.write_stream() 消费（普通会话）。"""
     with httpx.stream(
         "POST",
         f"{API_BASE}/chat/stream",
@@ -188,6 +189,164 @@ def stream_chat(session_id: str, message: str):
                 yield f"\n\n❌ {payload.get('message', '未知错误')}"
 
 
+def _iter_collab_events(session_id: str, message: str):
+    """同步生成器：逐个 yield 协作 SSE 事件 dict，供 UI 实时消费。"""
+    with httpx.stream(
+        "POST",
+        f"{API_BASE}/chat/stream",
+        json={"session_id": session_id, "message": message},
+        timeout=300,
+    ) as resp:
+        if resp.status_code != 200:
+            yield {"type": "error", "message": f"请求失败 ({resp.status_code})"}
+            return
+        for line in resp.iter_lines():
+            if not line.startswith("data: "):
+                continue
+            raw = line[6:]
+            if raw == "[DONE]":
+                return
+            try:
+                yield json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+
+
+_ROLE_ICON = {
+    "proposer":    "🎯",
+    "critic":      "🔍",
+    "creative":    "🌈",
+    "validator":   "📊",
+    "synthesizer": "🔀",
+    "master":      "👑",
+    "reviewer":    "⚖️",
+}
+
+
+def _render_round_table_process(process_events: list[dict]) -> None:
+    """圆桌模式：在 expander 内渲染各轮次各角色的观点。"""
+    round_entries: dict[int, list[dict]] = {}
+    synthesis_info: dict = {}
+
+    for ev in process_events:
+        t = ev.get("type", "")
+        if t == "collab_model_result":
+            rnd = ev.get("round", 1)
+            round_entries.setdefault(rnd, []).append(ev)
+        elif t == "collab_synthesis_start":
+            synthesis_info = ev
+        elif t == "error":
+            st.error(ev.get("message", "未知错误"))
+
+    if not round_entries:
+        st.caption("暂无过程数据。")
+        return
+
+    tab_labels = [f"Round {rnd}" for rnd in sorted(round_entries.keys())]
+    if len(tab_labels) == 1:
+        for entry in round_entries.get(1, []):
+            icon = _ROLE_ICON.get(entry.get("role", ""), "🤖")
+            label = entry.get("role_label", entry.get("role", ""))
+            model = entry.get("model_name", "")
+            st.markdown(f"**{icon} {label}** · `{model}`")
+            st.markdown(entry.get("content", ""))
+            st.divider()
+    else:
+        tabs = st.tabs(tab_labels)
+        for tab, rnd in zip(tabs, sorted(round_entries.keys())):
+            with tab:
+                for entry in round_entries[rnd]:
+                    icon = _ROLE_ICON.get(entry.get("role", ""), "🤖")
+                    label = entry.get("role_label", entry.get("role", ""))
+                    model = entry.get("model_name", "")
+                    st.markdown(f"**{icon} {label}** · `{model}`")
+                    st.markdown(entry.get("content", ""))
+                    st.divider()
+
+    if synthesis_info:
+        st.success(f"✅ 综合者：**{synthesis_info.get('model_name', '')}**")
+
+
+def _render_master_slave_review(process_events: list[dict]) -> None:
+    """
+    主从模式：整体放在可折叠 expander 内，内部紧凑排列。
+    默认折叠，让最终答案保持首要位置。
+    """
+    master_parts = [
+        e.get("content", "")
+        for e in process_events
+        if e.get("type") == "collab_model_text" and e.get("role") == "master"
+    ]
+    master_text     = "".join(master_parts)
+    reviewer_events = [e for e in process_events if e.get("type") == "collab_reviewer_result"]
+    synthesis_info  = next((e for e in process_events if e.get("type") == "collab_synthesis_start"), {})
+
+    if not reviewer_events:
+        return
+
+    best_score = synthesis_info.get("score", 0)
+    best_model = synthesis_info.get("model_name", "")
+    n          = len(reviewer_events)
+
+    with st.expander(f"📊 协作评审过程（{n} 位评委）", expanded=False):
+        # 主模型原始答案（折叠）
+        if master_text:
+            with st.expander("👑 主模型原始答案", expanded=False):
+                st.markdown(master_text)
+
+        # 每位评委：紧凑卡片
+        for res in reviewer_events:
+            model_name = res.get("model_name", "")
+            scores     = res.get("scores", {})
+            total      = res.get("weighted_total", 0)
+            critique   = res.get("critique", "")
+            improved   = res.get("improved_answer", "")
+            is_best    = bool(model_name == best_model and best_score)
+
+            with st.container(border=True):
+                # 名称 + 综合分（单行）
+                badge = " 🏆" if is_best else ""
+                c_name, c_total = st.columns([4, 1])
+                c_name.markdown(f"⚖️ **{model_name}**{badge}")
+                c_total.markdown(
+                    f"<div style='text-align:right;font-size:1.1rem;font-weight:700'>"
+                    f"{total} / 10</div>",
+                    unsafe_allow_html=True,
+                )
+
+                # 四维分项（单行紧凑，用 caption）
+                if scores:
+                    acc  = scores.get("accuracy",     "—")
+                    comp = scores.get("completeness",  "—")
+                    clar = scores.get("clarity",       "—")
+                    reas = scores.get("reasoning",     "—")
+                    st.caption(
+                        f"准确 **{acc}** · 完整 **{comp}** · 清晰 **{clar}** · 逻辑 **{reas}**"
+                    )
+
+                # 点评（小字）
+                if critique:
+                    st.caption(f"💬 {critique}")
+
+                # 改进版本（折叠，最优默认展开）
+                if improved and improved != master_text:
+                    with st.expander("📝 改进版本", expanded=is_best):
+                        st.markdown(improved)
+
+        # 底部结论
+        if best_model and best_score:
+            st.success(f"✅ 采用 **{best_model}** 改进版（综合最高 {best_score} / 10）")
+
+
+def _render_collab_process(process_events: list[dict]) -> None:
+    """兼容入口：根据事件类型自动分派到对应渲染函数（供 expander 内调用）。"""
+    has_reviewer = any(e.get("type") == "collab_reviewer_result" for e in process_events)
+    if has_reviewer:
+        _render_master_slave_review(process_events)
+    else:
+        _render_round_table_process(process_events)
+
+
 # ── Session state 初始化 ──────────────────────────────────────────────────────
 
 for _k, _v in [
@@ -195,9 +354,12 @@ for _k, _v in [
     ("chat_history", []),
     ("editing_config_id", None),
     ("renaming_session_id", None),
-    ("selected_sp_id", None),       # 当前侧边栏选中的 system prompt id
-    ("editing_sp_id", None),        # 正在编辑的 system prompt id
-    ("editing_tool_id", None),      # 正在编辑的 HTTP 工具 id
+    ("selected_sp_id", None),         # 当前侧边栏选中的 system prompt id
+    ("editing_sp_id", None),          # 正在编辑的 system prompt id
+    ("editing_tool_id", None),        # 正在编辑的 HTTP 工具 id
+    ("collab_show_form", False),           # 是否展开协作会话创建表单
+    ("active_session_collab_mode", None),  # 当前活跃会话的协作模式
+    ("last_collab_process", []),           # 最近一次协作过程事件，用于持久显示
 ]:
     if _k not in st.session_state:
         st.session_state[_k] = _v
@@ -523,19 +685,117 @@ with st.sidebar:
     st.divider()
     st.subheader("💬 会话列表")
 
-    if st.button("＋ 新建会话", use_container_width=True, type="primary"):
+    # 普通新建
+    col_new, col_collab = st.columns(2)
+    if col_new.button("＋ 普通会话", use_container_width=True, type="primary"):
         if not active_config:
             st.error("请先配置并激活一个模型。")
         else:
             sp_id = st.session_state.get("selected_sp_id")
-            result = api("POST", "/sessions/", json={
-                "title": "新会话",
-                "system_prompt_id": sp_id,
-            })
+            result = api("POST", "/sessions/", json={"title": "新会话", "system_prompt_id": sp_id})
             if result:
                 st.session_state.active_session_id = result["id"]
+                st.session_state.active_session_collab_mode = None
                 st.session_state.chat_history = []
                 st.rerun()
+
+    if col_collab.button("⚡ 协作会话", use_container_width=True):
+        st.session_state.collab_show_form = not st.session_state.collab_show_form
+        st.rerun()
+
+    # 协作会话创建表单（折叠）
+    if st.session_state.collab_show_form:
+        with st.container(border=True):
+            st.caption("⚡ 新建多模型协作会话")
+            if len(configs) < 2:
+                st.warning("至少需要 2 个模型配置才能使用协作模式。")
+            else:
+                collab_mode_sel = st.radio(
+                    "协作模式",
+                    ["🔀 圆桌模式（B+C 迭代辩论）", "👑 主从模式（主答 + 评委评分）"],
+                    horizontal=True,
+                    label_visibility="collapsed",
+                )
+                is_round_table = "圆桌" in collab_mode_sel
+
+                config_options = {f"{c['display_name']} · {c['model']}": c["id"] for c in configs}
+                config_labels = list(config_options.keys())
+
+                _ROLES_RT = ["proposer（提案者）", "critic（批判者）",
+                              "creative（创意者）", "validator（验证者）", "synthesizer（综合者）"]
+                _ROLE_KEYS = ["proposer", "critic", "creative", "validator", "synthesizer"]
+
+                if is_round_table:
+                    n_models = st.slider("模型数量", min_value=2, max_value=min(5, len(configs)), value=min(3, len(configs)))
+                    rounds_rt = st.radio("讨论轮次", [1, 2], index=1,
+                                         format_func=lambda x: f"{x} 轮（{'仅独立作答' if x == 1 else '独立作答 + 交叉审视'}）",
+                                         horizontal=True)
+                    st.caption("最后一个槽位固定为综合者，其余按序自动分配角色。")
+                    rt_model_ids = []
+                    for i in range(n_models):
+                        auto_role = _ROLES_RT[min(i, len(_ROLES_RT) - 1)] if i < n_models - 1 else _ROLES_RT[-1]
+                        default_idx = min(i, len(config_labels) - 1)
+                        sel = st.selectbox(
+                            f"槽位 {i+1}：{auto_role}",
+                            config_labels,
+                            index=default_idx,
+                            key=f"rt_slot_{i}",
+                        )
+                        rt_model_ids.append(config_options[sel])
+
+                    sp_id_c = st.session_state.get("selected_sp_id")
+                    if st.button("✅ 创建圆桌会话", use_container_width=True, type="primary"):
+                        roles = [_ROLE_KEYS[min(i, len(_ROLE_KEYS) - 1)] if i < n_models - 1
+                                 else "synthesizer" for i in range(n_models)]
+                        collab_cfg = {
+                            "mode": "round_table",
+                            "rounds": rounds_rt,
+                            "models": [{"config_id": str(cid), "role": r}
+                                       for cid, r in zip(rt_model_ids, roles)],
+                        }
+                        result = api("POST", "/sessions/", json={
+                            "title": "新会话",
+                            "system_prompt_id": sp_id_c,
+                            "collab_mode": "round_table",
+                            "collab_config": collab_cfg,
+                        })
+                        if result:
+                            st.session_state.active_session_id = result["id"]
+                            st.session_state.active_session_collab_mode = "round_table"
+                            st.session_state.chat_history = []
+                            st.session_state.collab_show_form = False
+                            st.rerun()
+                else:
+                    st.caption("主模型负责作答，评委模型并行评审打分。")
+                    master_sel = st.selectbox("主模型", config_labels, key="ms_master")
+                    remaining = [l for l in config_labels if l != master_sel] or config_labels
+                    max_rev = min(4, len(remaining))
+                    n_rev = st.slider("评委数量", 1, max_rev, min(2, max_rev))
+                    reviewer_ids = []
+                    for i in range(n_rev):
+                        default_idx = min(i, len(remaining) - 1)
+                        sel = st.selectbox(f"评委 {i+1}", remaining, index=default_idx, key=f"ms_rev_{i}")
+                        reviewer_ids.append(config_options[sel])
+
+                    sp_id_c = st.session_state.get("selected_sp_id")
+                    if st.button("✅ 创建主从会话", use_container_width=True, type="primary"):
+                        collab_cfg = {
+                            "mode": "master_slave",
+                            "master_config_id": str(config_options[master_sel]),
+                            "reviewer_config_ids": [str(rid) for rid in reviewer_ids],
+                        }
+                        result = api("POST", "/sessions/", json={
+                            "title": "新会话",
+                            "system_prompt_id": sp_id_c,
+                            "collab_mode": "master_slave",
+                            "collab_config": collab_cfg,
+                        })
+                        if result:
+                            st.session_state.active_session_id = result["id"]
+                            st.session_state.active_session_collab_mode = "master_slave"
+                            st.session_state.chat_history = []
+                            st.session_state.collab_show_form = False
+                            st.rerun()
 
     sessions: list[dict] = api("GET", "/sessions/", silent=True) or []
 
@@ -558,12 +818,14 @@ with st.sidebar:
 
     for s in sessions:
         is_current = s["id"] == st.session_state.active_session_id
+        collab_badge = "⚡ " if s.get("collab_mode") else ""
         col_name, col_ren, col_del = st.columns([5, 1, 1])
 
         with col_name:
-            label = ("▶ " if is_current else "") + s["title"]
+            label = ("▶ " if is_current else "") + collab_badge + s["title"]
             if st.button(label, key=f"s_{s['id']}", use_container_width=True):
                 st.session_state.active_session_id = s["id"]
+                st.session_state.active_session_collab_mode = s.get("collab_mode")
                 st.session_state.selected_sp_id = s.get("system_prompt_id")
                 st.session_state.chat_history = [
                     {"role": m["role"], "content": m["content"] or ""}
@@ -584,6 +846,7 @@ with st.sidebar:
                 api("DELETE", f"/sessions/{s['id']}")
                 if s["id"] == st.session_state.active_session_id:
                     st.session_state.active_session_id = None
+                    st.session_state.active_session_collab_mode = None
                     st.session_state.chat_history = []
                 st.rerun()
 
@@ -607,38 +870,166 @@ if not st.session_state.active_session_id:
 # 顶部标题栏
 session_data = api("GET", f"/sessions/{st.session_state.active_session_id}", silent=True)
 if session_data:
+    # 同步协作模式状态（切换会话时）
+    if st.session_state.active_session_collab_mode != session_data.get("collab_mode"):
+        st.session_state.active_session_collab_mode = session_data.get("collab_mode")
+
     col_title, col_model = st.columns([6, 1])
     with col_title:
-        st.subheader(session_data["title"])
+        collab_mode = session_data.get("collab_mode")
+        title_prefix = {"round_table": "⚡ 圆桌 · ", "master_slave": "⚡ 主从 · "}.get(collab_mode or "", "")
+        st.subheader(title_prefix + session_data["title"])
         sp_ref = session_data.get("system_prompt_ref")
         if sp_ref:
             st.caption(f"📋 System Prompt：`{sp_ref['name']}`")
     with col_model:
-        model_label = active_config["model"] if active_config else "未配置"
-        st.caption(f"`{model_label}`")
+        if collab_mode:
+            cfg_data = session_data.get("collab_config") or {}
+            n_models = len(cfg_data.get("models", [])) or (
+                1 + len(cfg_data.get("reviewer_config_ids", []))
+            )
+            st.caption(f"⚡ 协作 · {n_models} 模型")
+        else:
+            model_label = active_config["model"] if active_config else "未配置"
+            st.caption(f"`{model_label}`")
 
 st.divider()
 
 # 渲染历史消息
-for msg in st.session_state.chat_history:
+_history = st.session_state.chat_history
+_last_collab = st.session_state.get("last_collab_process", [])
+
+for i, msg in enumerate(_history):
     with st.chat_message(msg["role"]):
+        # 最后一条 assistant 消息：若有协作过程数据，显示在答案上方
+        if (
+            msg["role"] == "assistant"
+            and i == len(_history) - 1
+            and _last_collab
+        ):
+            _has_reviewer    = any(e.get("type") == "collab_reviewer_result" for e in _last_collab)
+            _has_round_table = any(e.get("type") == "collab_model_result"    for e in _last_collab)
+            if _has_reviewer:
+                _render_master_slave_review(_last_collab)
+            elif _has_round_table:
+                with st.expander("🔄 协作决策过程", expanded=False):
+                    _render_round_table_process(_last_collab)
         st.markdown(msg["content"])
 
 # ── 对话输入 ──────────────────────────────────────────────────────────────────
 
-if prompt := st.chat_input("发送消息给 AgentNexus-J..."):
-    if not active_config:
+_is_collab = bool(st.session_state.get("active_session_collab_mode"))
+_hint = "发送消息给协作团队..." if _is_collab else "发送消息给 AgentNexus-J..."
+
+if prompt := st.chat_input(_hint):
+    if not _is_collab and not active_config:
         st.error("请先在左侧配置并激活一个模型。")
         st.stop()
 
+    # 新消息到来：清除上一次的协作过程（用户已看完）
+    st.session_state.last_collab_process = []
     st.session_state.chat_history.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    with st.chat_message("assistant"):
-        reply = st.write_stream(
-            stream_chat(st.session_state.active_session_id, prompt)
-        )
+    if _is_collab:
+        with st.chat_message("assistant"):
+            # ── 实时展示区域 ──────────────────────────────────────────────────
+            phase_ph   = st.empty()   # 当前阶段说明
+            live_ph    = st.empty()   # 主模型流式文字 / 最终答案流式文字
+            score_ph   = st.empty()   # 评委进度（每完成一个更新一次）
+
+            process_events: list[dict] = []
+            final_text_parts: list[str] = []
+            master_text_live  = ""
+            final_text_live   = ""
+            reviewer_live: list[str] = []   # 已完成的评委摘要行
+
+            for ev in _iter_collab_events(st.session_state.active_session_id, prompt):
+                t = ev.get("type", "")
+
+                # ── 阶段提示 ──────────────────────────────────────────────────
+                if t == "collab_phase":
+                    phase_ph.info(f"⚡ {ev.get('label', '')}...")
+                    process_events.append(ev)
+
+                # ── 主模型流式文字（主从专用）────────────────────────────────
+                elif t == "collab_model_text" and ev.get("role") == "master":
+                    master_text_live += ev.get("content", "")
+                    live_ph.markdown(master_text_live + "▌")
+                    process_events.append(ev)
+
+                elif t == "collab_model_end" and ev.get("role") == "master":
+                    live_ph.markdown(master_text_live)   # 去掉光标
+                    process_events.append(ev)
+
+                # ── 圆桌：某模型本轮回答完成 ─────────────────────────────────
+                elif t == "collab_model_result":
+                    role_label = ev.get("role_label", ev.get("role", ""))
+                    model_name = ev.get("model_name", "")
+                    phase_ph.info(f"✅ {role_label}（{model_name}）完成")
+                    process_events.append(ev)
+
+                # ── 主从：某评委评审完成 ──────────────────────────────────────
+                elif t == "collab_reviewer_result":
+                    model_name = ev.get("model_name", "")
+                    total      = ev.get("weighted_total", 0)
+                    critique   = ev.get("critique", "")
+                    reviewer_live.append(
+                        f"**⚖️ {model_name}**  综合 **{total}/10**  \n💬 {critique}"
+                    )
+                    score_ph.markdown("\n\n---\n\n".join(reviewer_live))
+                    process_events.append(ev)
+
+                # ── 综合者开始 ────────────────────────────────────────────────
+                elif t == "collab_synthesis_start":
+                    phase_ph.info(f"🔀 综合者（{ev.get('model_name','')}）正在输出最终答案...")
+                    live_ph.empty()    # 清空主模型文字，准备显示最终答案
+                    process_events.append(ev)
+
+                # ── 最终答案流式文字 ──────────────────────────────────────────
+                elif t == "text":
+                    final_text_parts.append(ev.get("content", ""))
+                    final_text_live = "".join(final_text_parts)
+                    live_ph.markdown(final_text_live + "▌")
+
+                elif t == "error":
+                    phase_ph.error(ev.get("message", "未知错误"))
+                    process_events.append(ev)
+
+                elif t == "done":
+                    break
+
+            # ── 流结束：清除实时占位符，渲染最终结果 ─────────────────────────
+            phase_ph.empty()
+            live_ph.empty()
+            score_ph.empty()
+
+            final_text = "".join(final_text_parts)
+
+            # 持久化协作过程到 session_state（下一条用户消息到来前保持可见）
+            st.session_state.last_collab_process = process_events
+
+            has_reviewer    = any(e.get("type") == "collab_reviewer_result" for e in process_events)
+            has_round_table = any(e.get("type") == "collab_model_result"    for e in process_events)
+
+            if has_reviewer:
+                _render_master_slave_review(process_events)
+            elif has_round_table:
+                with st.expander("🔄 协作决策过程", expanded=True):
+                    _render_round_table_process(process_events)
+
+            if final_text:
+                st.markdown(final_text)
+            else:
+                st.warning("未收到最终答案，请检查协作配置。")
+
+            reply = final_text
+    else:
+        with st.chat_message("assistant"):
+            reply = st.write_stream(
+                stream_chat(st.session_state.active_session_id, prompt)
+            )
 
     if reply:
         st.session_state.chat_history.append({"role": "assistant", "content": reply})
