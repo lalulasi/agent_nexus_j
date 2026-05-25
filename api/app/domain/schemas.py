@@ -1,72 +1,144 @@
-from pydantic import BaseModel, Field, ConfigDict
+import uuid
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+
+from pydantic import BaseModel, Field
 
 
-class CustomAPIToolConfig(BaseModel):
-    name: str = Field(..., description="工具名称 (英文，如 get_weather)")
-    description: str = Field(..., description="工具描述，告诉 AI 何时使用")
-    url: str = Field(..., description="API 目标地址 (POST请求)")
-    parameters: Dict[str, Any] = Field(..., description="OpenAI 格式的 JSON Schema")
+# ── LLMConfig ─────────────────────────────────────────────────────────────────
+
+class LLMConfigCreate(BaseModel):
+    display_name: str = Field(..., min_length=1, max_length=100)
+    model: str = Field(..., min_length=1, max_length=100)
+    api_key: str = Field(..., min_length=1)
+    base_url: str | None = None
 
 
-class SessionCreate(BaseModel):
-    title: str = Field(default="New Conversation", description="会话的初始标题")
-    model_provider: Optional[str] = Field(default="deepseek", description="选用的 AI 模型")
+class LLMConfigUpdate(BaseModel):
+    display_name: str | None = None
+    model: str | None = None
+    api_key: str | None = None   # None 表示不修改；空字符串无效
+    base_url: str | None = None  # 空字符串清除
 
 
-class SessionResponse(BaseModel):
-    id: str
-    title: str
-    model_provider: Optional[str]
+class LLMConfigOut(BaseModel):
+    id: uuid.UUID
+    display_name: str
+    model: str
+    api_key_masked: str
+    base_url: str | None
+    is_active: bool
     created_at: datetime
     updated_at: datetime
-    custom_tools: Optional[List[Any]] = []
-    model_config = ConfigDict(from_attributes=True)
+
+    model_config = {"from_attributes": True}
+
+    @classmethod
+    def from_orm_mask(cls, obj) -> "LLMConfigOut":
+        key = obj.api_key
+        masked = key[:6] + "****" + key[-4:] if len(key) > 10 else "****"
+        return cls(
+            id=obj.id,
+            display_name=obj.display_name,
+            model=obj.model,
+            api_key_masked=masked,
+            base_url=obj.base_url,
+            is_active=obj.is_active,
+            created_at=obj.created_at,
+            updated_at=obj.updated_at,
+        )
 
 
-class MessageCreate(BaseModel):
-    role: str = Field(..., description="角色：user, assistant, system")
-    content: str = Field(..., description="消息文本内容")
+# ── SystemPrompt ──────────────────────────────────────────────────────────────
 
-# 🌟 新增：代表多智能体网络中的一个节点
-class SwarmNode(BaseModel):
-    provider_name: str
-    api_key: str
-    base_url: str
-    text_model: str
-    # 🌟 新增：专属工具箱
-    assigned_tools: Optional[List[str]] = []  # 🌟 修复：改为字符串列表，只传工具名称，极简轻量！
-
-class ChatRequest(BaseModel):
-    user_input: Optional[str] = None
-    image_base64: Optional[str] = None
-    file_name: Optional[str] = None
-    file_content: Optional[str] = None
-    system_prompt: Optional[str] = None
-
-    # 兼容原有的单模型模式
-    api_key: str
-    base_url: str
-    text_model: str
-    vision_model: Optional[str] = None
-    custom_tools: Optional[List[CustomAPIToolConfig]] = Field(default_factory=list)
-
-    # 🌟 新增：多智能体协作专用字段
-    swarm_mode: Optional[str] = None  # 可选值: "maker_checker" 或 "roundtable"
-    swarm_nodes: Optional[List[SwarmNode]] = Field(default_factory=list)
-
-    action: str = "chat"
-    pending_tool_name: Optional[str] = None
-    pending_tool_args: Optional[str] = None
+class SystemPromptCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    content: str = Field(..., min_length=1)
 
 
-class MessageResponse(BaseModel):
-    id: str
-    session_id: str
-    role: str
+class SystemPromptUpdate(BaseModel):
+    name: str | None = None
+    content: str | None = None
+
+
+class SystemPromptOut(BaseModel):
+    id: uuid.UUID
+    name: str
     content: str
     created_at: datetime
-    status: str = "completed"
-    pending_action: Optional[Dict[str, Any]] = None
-    model_config = ConfigDict(from_attributes=True)
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+# ── Message ───────────────────────────────────────────────────────────────────
+
+class MessageBase(BaseModel):
+    role: str
+    content: str | None = None
+    tool_calls: dict | None = None
+    tool_results: dict | None = None
+
+
+class MessageCreate(MessageBase):
+    session_id: uuid.UUID
+
+
+class MessageOut(MessageBase):
+    id: uuid.UUID
+    session_id: uuid.UUID
+    token_count: int | None = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+# ── Session ───────────────────────────────────────────────────────────────────
+
+class SessionCreate(BaseModel):
+    title: str = "新会话"
+    system_prompt_id: uuid.UUID | None = None
+    meta: dict | None = None
+
+
+class SessionUpdate(BaseModel):
+    title: str | None = None
+    system_prompt_id: uuid.UUID | None = None  # 传 None 表示不修改，传 "" 语义上用特殊值
+    clear_system_prompt: bool = False           # 显式清除关联
+    status: str | None = None
+    meta: dict | None = None
+
+
+class SystemPromptBrief(BaseModel):
+    id: uuid.UUID
+    name: str
+
+    model_config = {"from_attributes": True}
+
+
+class SessionOut(BaseModel):
+    id: uuid.UUID
+    title: str
+    system_prompt_id: uuid.UUID | None
+    system_prompt_ref: SystemPromptBrief | None = None
+    model: str
+    status: str
+    meta: dict | None
+    created_at: datetime
+    updated_at: datetime
+    messages: list[MessageOut] = Field(default_factory=list)
+
+    model_config = {"from_attributes": True}
+
+
+# ── Chat ──────────────────────────────────────────────────────────────────────
+
+class ChatRequest(BaseModel):
+    session_id: uuid.UUID
+    message: str = Field(..., min_length=1)
+    stream: bool = False
+
+
+class ChatResponse(BaseModel):
+    session_id: uuid.UUID
+    message: MessageOut
+    usage: dict | None = None

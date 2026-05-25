@@ -1,37 +1,82 @@
 import uuid
 from datetime import datetime
-from typing import List, Optional
 
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from sqlalchemy import String, DateTime, func, ForeignKey, Text, Column, JSON
+
 
 class Base(DeclarativeBase):
     pass
 
+
+class LLMConfig(Base):
+    """用户保存的大语言模型接入配置，is_active=True 为当前默认配置。"""
+
+    __tablename__ = "llm_configs"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    display_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    model: Mapped[str] = mapped_column(String(100), nullable=False)
+    api_key: Mapped[str] = mapped_column(Text, nullable=False)
+    base_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class SystemPrompt(Base):
+    """可复用的 System Prompt 库，与模型无关，按需分配给会话。"""
+
+    __tablename__ = "system_prompts"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class AgentSession(Base):
     __tablename__ = "agent_sessions"
 
-    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()), index=True)
-    title: Mapped[str] = mapped_column(String, nullable=False, default="New Conversation")
-    model_provider: Mapped[str] = mapped_column(String, nullable=True, default="deepseek")
-
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    title: Mapped[str] = mapped_column(String(255), nullable=False, default="新会话")
+    system_prompt_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("system_prompts.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    model: Mapped[str] = mapped_column(String(100), nullable=False, default="")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
+    meta: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
-    messages: Mapped[List["Message"]] = relationship("Message", back_populates="session", cascade="all, delete-orphan")
-    custom_tools = Column(JSON, default=list)
+    messages: Mapped[list["Message"]] = relationship(
+        "Message", back_populates="session", cascade="all, delete-orphan", lazy="selectin"
+    )
+    system_prompt_ref: Mapped["SystemPrompt | None"] = relationship("SystemPrompt", lazy="selectin")
+
 
 class Message(Base):
     __tablename__ = "messages"
 
-    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()), index=True)
-    session_id: Mapped[str] = mapped_column(ForeignKey("agent_sessions.id", ondelete="CASCADE"), index=True)
-    role: Mapped[str] = mapped_column(String, nullable=False)
-    content: Mapped[str] = mapped_column(Text, nullable=False)
-    name: Mapped[Optional[str]] = mapped_column(String, nullable=True) # 🌟 补齐 name 字段
-
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agent_sessions.id", ondelete="CASCADE"), nullable=False
+    )
+    role: Mapped[str] = mapped_column(String(20), nullable=False)
+    content: Mapped[str | None] = mapped_column(Text, nullable=True)
+    tool_calls: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    tool_results: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    token_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    session: Mapped["AgentSession"] = relationship("AgentSession", back_populates="messages")
 
-    def __repr__(self) -> str:
-        return f"<Message(id={self.id}, role={self.role})>"
+    session: Mapped["AgentSession"] = relationship("AgentSession", back_populates="messages")

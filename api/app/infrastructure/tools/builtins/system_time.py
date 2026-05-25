@@ -1,28 +1,14 @@
-import datetime
-from app.core.logger import logger
-from app.infrastructure.tools.base import BaseTool
+from datetime import datetime, timezone
+from typing import Any
+
+from api.app.infrastructure.tools.base import BaseTool
 
 
-class GetSystemTimeTool(BaseTool):
-    """获取系统当前时间的工具"""
+class SystemTimeTool(BaseTool):
+    name = "get_system_time"
+    description = "Returns the current UTC time and the local timezone offset."
+    input_schema = {"type": "object", "properties": {}, "required": []}
 
-    @property
-    def name(self) -> str:
-        return "get_current_system_time"
-
-    @property
-    def description(self) -> str:
-        return "Get the current local system time. Use this when you need to know the current date or time."
-
-    @property
-    def parameters(self) -> dict:
-        return {
-            "type": "object",
-            "properties": {}
-        }
-
-    async def execute(self, **kwargs) -> str:
-        logger.info("Executing GetSystemTimeTool to fetch local time.")
-        current_time = datetime.datetime.now().strftime("%Y-%m-%docs_daily_logs_2026-05-12_work_log.md %H:%M:%S")
-        logger.debug(f"Fetched time: {current_time}")
-        return f"The current system time is: {current_time}"
+    async def run(self, **kwargs: Any) -> str:
+        now = datetime.now(timezone.utc)
+        return f"Current UTC time: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}"

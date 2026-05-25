@@ -1,12 +1,13 @@
 [theme]
-primaryColor = "#4F8BFF"
-# 主体背景：深碳灰，非死黑
-backgroundColor = "#181818"
-# 侧边栏/浮窗背景：稍微亮一点点，拉开层次
-secondaryBackgroundColor = "#222222"
-# 字体颜色：柔和的亮白
-textColor = "#E0E0E0"
-font = "sans serif"
+base = "light"
+primaryColor = "#5B6EFF"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F0F2F6"
+textColor = "#31333F"
 
-[client]
-toolbarMode = "minimal" # 隐藏右上角的各种 Streamlit 原生杂项
+[server]
+port = 8501
+headless = true
+
+[browser]
+gatherUsageStats = false

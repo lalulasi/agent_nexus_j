@@ -1,473 +1,600 @@
-import streamlit as st
-import requests
-import base64
+"""AgentNexus-J — Streamlit 控制台"""
+
 import json
-import os
+from datetime import datetime
 
-API_BASE_URL = "http://localhost:8000/api/v1"
-CONFIG_FILE = ".agent_config.json"
-SECRET_SALT = "NexusJ2026"
+import httpx
+import streamlit as st
 
-st.set_page_config(page_title="AgentNexus-J", page_icon="🤖", layout="wide")
+# ── 自动主题（白天 < 18:00 用亮色，之后用暗色）────────────────────────────────
 
-st.markdown("""
+_NIGHT_CSS = """
 <style>
-    footer {visibility: hidden;}
-    [data-testid="stSidebar"] { border-right: 1px solid rgba(128, 128, 128, 0.2); }
-    .stChatMessage { animation: fadeIn 0.5s; }
-    @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+/* ══ AgentNexus-J 夜间主题 ══ */
+
+/* 主背景 */
+.stApp {
+    background-color: #0E1117 !important;
+}
+
+/* 顶部装饰条 */
+[data-testid="stDecoration"] {
+    background-image: linear-gradient(90deg, #5B6EFF, #8B5CF6) !important;
+}
+
+/* 侧边栏 */
+section[data-testid="stSidebar"] > div:first-child {
+    background-color: #1A1D27 !important;
+}
+
+/* 通用文字 */
+.stApp p, .stApp span, .stApp label,
+.stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp h6,
+.stMarkdown p, .stMarkdown li,
+[data-testid="stText"] {
+    color: #FAFAFA !important;
+}
+[data-testid="stCaptionContainer"] p,
+.stCaption {
+    color: #9095A5 !important;
+}
+
+/* 输入框 & 文本域 */
+.stTextInput input,
+.stTextArea textarea,
+[data-baseweb="input"] input {
+    background-color: #262730 !important;
+    color: #FAFAFA !important;
+    border-color: #3D4051 !important;
+}
+[data-baseweb="base-input"] {
+    background-color: #262730 !important;
+}
+
+/* 下拉选择框 */
+[data-baseweb="select"] > div:first-child {
+    background-color: #262730 !important;
+    border-color: #3D4051 !important;
+    color: #FAFAFA !important;
+}
+[data-baseweb="select"] span,
+[data-baseweb="select"] div {
+    color: #FAFAFA !important;
+}
+[data-baseweb="menu"] {
+    background-color: #262730 !important;
+    border-color: #3D4051 !important;
+}
+[data-baseweb="menu"] li {
+    color: #FAFAFA !important;
+}
+[data-baseweb="menu"] li:hover,
+[data-baseweb="menu"] [aria-selected="true"] {
+    background-color: #3A3D50 !important;
+}
+
+/* 普通按钮 */
+.stButton > button {
+    background-color: #262730 !important;
+    color: #FAFAFA !important;
+    border-color: #3D4051 !important;
+}
+.stButton > button:hover {
+    background-color: #3A3D50 !important;
+    border-color: #5B6EFF !important;
+    color: #FFFFFF !important;
+}
+
+/* Primary 按钮保持品牌色 */
+.stButton > button[kind="primary"] {
+    background-color: #5B6EFF !important;
+    border-color: #5B6EFF !important;
+    color: #FFFFFF !important;
+}
+.stButton > button[kind="primary"]:hover {
+    background-color: #4A5AE8 !important;
+    border-color: #4A5AE8 !important;
+}
+
+/* 表单容器 */
+[data-testid="stForm"] {
+    border-color: #3D4051 !important;
+    background-color: transparent !important;
+}
+
+/* Expander */
+[data-testid="stExpander"] details {
+    background-color: #1A1D27 !important;
+    border-color: #3D4051 !important;
+}
+[data-testid="stExpander"] summary,
+[data-testid="stExpander"] summary span {
+    color: #FAFAFA !important;
+}
+
+/* Chat 消息气泡 */
+[data-testid="stChatMessage"] {
+    background-color: #1A1D27 !important;
+}
+[data-testid="stChatMessageContent"] p {
+    color: #FAFAFA !important;
+}
+
+/* Radio & Checkbox */
+[data-testid="stRadio"] label p,
+[data-testid="stCheckbox"] label p {
+    color: #FAFAFA !important;
+}
+
+/* 分割线 */
+hr {
+    border-color: #3D4051 !important;
+}
+
+/* 行内代码 */
+code {
+    background-color: #262730 !important;
+    color: #C4A8FF !important;
+}
+
+/* 成功 / 错误 / 警告横幅 */
+[data-testid="stNotification"][data-baseweb="notification"] {
+    background-color: #1A1D27 !important;
+}
+div[data-testid="stAlert"][kind="success"] {
+    background-color: #0B2318 !important;
+    color: #6EE7B7 !important;
+}
+div[data-testid="stAlert"][kind="error"] {
+    background-color: #2B0D0D !important;
+    color: #FCA5A5 !important;
+}
+div[data-testid="stAlert"][kind="warning"] {
+    background-color: #2B1D00 !important;
+    color: #FCD34D !important;
+}
+
+/* 聊天输入框 */
+[data-testid="stChatInput"] textarea {
+    background-color: #262730 !important;
+    color: #FAFAFA !important;
+    border-color: #3D4051 !important;
+}
+[data-testid="stChatInputContainer"] {
+    background-color: #1A1D27 !important;
+    border-color: #3D4051 !important;
+}
 </style>
-""", unsafe_allow_html=True)
+"""
 
-# ==========================================
-# 💾 状态初始化
-# ==========================================
-if "session_id" not in st.session_state: st.session_state.session_id = None
-if "messages" not in st.session_state: st.session_state.messages = []
-if "custom_tools" not in st.session_state: st.session_state.custom_tools = []
-if "pending_action" not in st.session_state: st.session_state.pending_action = None
-if "rename_id" not in st.session_state: st.session_state.rename_id = None
-if "pending_model_install" not in st.session_state: st.session_state.pending_model_install = None
-if "interrupted_payload" not in st.session_state: st.session_state.interrupted_payload = None
+_DAY_CSS = """
+<style>
+/* ══ AgentNexus-J 白天主题 ══ */
+
+/* 顶部品牌装饰条 */
+[data-testid="stDecoration"] {
+    background-image: linear-gradient(90deg, #5B6EFF, #8B5CF6) !important;
+}
+
+/* 成功提示（已激活）— 深绿文字 + 浅薄荷底 */
+div[data-testid="stAlert"][kind="success"],
+div.stSuccess > div {
+    background-color: #D1FAE5 !important;
+    border-left-color: #059669 !important;
+}
+div[data-testid="stAlert"][kind="success"] p,
+div[data-testid="stAlert"][kind="success"] span,
+div.stSuccess > div p,
+div.stSuccess > div span {
+    color: #065F46 !important;
+}
+
+/* Caption 中的 inline code（Key / URL 展示） */
+[data-testid="stCaptionContainer"] code {
+    background-color: #EFF6FF !important;
+    color: #1E40AF !important;
+    border-radius: 4px !important;
+    padding: 1px 4px !important;
+}
+
+/* Caption 普通文字 */
+[data-testid="stCaptionContainer"] p {
+    color: #4B5563 !important;
+}
+</style>
+"""
 
 
-def encrypt_key(key: str) -> str:
-    if not key: return ""
-    xored = "".join(chr(ord(c) ^ ord(SECRET_SALT[i % len(SECRET_SALT)])) for i, c in enumerate(key))
-    return base64.b64encode(xored.encode()).decode()[::-1]
+def _inject_theme() -> None:
+    hour = datetime.now().hour
+    st.markdown(_NIGHT_CSS if hour >= 18 else _DAY_CSS, unsafe_allow_html=True)
 
+API_BASE = "http://localhost:8000/api/v1"
 
-def decrypt_key(encrypted: str) -> str:
-    if not encrypted: return ""
+st.set_page_config(
+    page_title="AgentNexus-J",
+    page_icon="💠",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+_inject_theme()
+
+# ── HTTP 工具 ──────────────────────────────────────────────────────────────────
+
+def api(method: str, path: str, silent: bool = False, **kwargs):
     try:
-        b64_decoded = base64.b64decode(encrypted[::-1]).decode()
-        return "".join(chr(ord(c) ^ ord(SECRET_SALT[i % len(SECRET_SALT)])) for i, c in enumerate(b64_decoded))
-    except:
-        return ""
+        resp = httpx.request(method, f"{API_BASE}{path}", timeout=120, **kwargs)
+        resp.raise_for_status()
+        return True if resp.status_code == 204 else resp.json()
+    except httpx.HTTPStatusError as e:
+        if not silent:
+            try:
+                detail = e.response.json().get("detail", e.response.text)
+            except Exception:
+                detail = e.response.text
+            st.error(f"请求失败 ({e.response.status_code})：{detail}")
+    except httpx.ConnectError:
+        if not silent:
+            st.error("无法连接后台服务，请确认 FastAPI 已启动（端口 8000）。")
+    return None
 
 
-def load_config():
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-                for p, d in cfg.items():
-                    if "api_key" in d: d["api_key"] = decrypt_key(d["api_key"])
-                return cfg
-        except:
-            pass
-    return {
-        "DeepSeek (官方)": {"base_url": "https://api.deepseek.com/v1", "api_key": "", "text_model": "deepseek-chat",
-                            "vision_model": ""},
-        "Qwen (通义千问)": {"base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "api_key": "",
-                            "text_model": "qwen-plus", "vision_model": ""}
-    }
+def stream_chat(session_id: str, message: str):
+    """同步生成器，供 st.write_stream() 消费。"""
+    with httpx.stream(
+        "POST",
+        f"{API_BASE}/chat/stream",
+        json={"session_id": session_id, "message": message},
+        timeout=180,
+    ) as resp:
+        if resp.status_code != 200:
+            yield f"❌ 请求失败 ({resp.status_code})"
+            return
+        for line in resp.iter_lines():
+            if not line.startswith("data: "):
+                continue
+            raw = line[6:]
+            if raw == "[DONE]":
+                return
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            ptype = payload.get("type")
+            if ptype == "text":
+                yield payload["content"]
+            elif ptype == "tool_start":
+                tools = "、".join(payload.get("tools", []))
+                yield f"\n\n> 🔧 调用工具：{tools}...\n\n"
+            elif ptype == "tool_end":
+                yield "\n\n"
+            elif ptype == "error":
+                yield f"\n\n❌ {payload.get('message', '未知错误')}"
 
 
-def save_all_configs(configs):
-    to_save = {}
-    for p, d in configs.items():
-        to_save[p] = {"base_url": d.get("base_url", ""), "api_key": encrypt_key(d.get("api_key", "")),
-                      "text_model": d.get("text_model", ""), "vision_model": d.get("vision_model", "")}
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f: json.dump(to_save, f)
+# ── Session state 初始化 ──────────────────────────────────────────────────────
 
+for _k, _v in [
+    ("active_session_id", None),
+    ("chat_history", []),
+    ("editing_config_id", None),
+    ("renaming_session_id", None),
+    ("selected_sp_id", None),       # 当前侧边栏选中的 system prompt id
+    ("editing_sp_id", None),        # 正在编辑的 system prompt id
+]:
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
 
-if "user_config" not in st.session_state: st.session_state.user_config = load_config()
+# ── 侧边栏 ────────────────────────────────────────────────────────────────────
 
-PERSONA_FILE = ".agent_personas.json"
-
-
-def load_personas():
-    if os.path.exists(PERSONA_FILE):
-        try:
-            with open(PERSONA_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except:
-            pass
-    return {
-        "🌐 原生模式 (无预设)": "",
-        "🤖 通用助手": "你是一个有用的AI助手。回答简明扼要。",
-        "🐧 Linux 运维专家": "你是一个资深的服务器运维专家。尽量不闲聊，遇到问题直接输出可执行的 Bash 命令或脚本，并对高危命令做出提醒。",
-        "✍️ 毒舌代码审查员": "你是一个极其挑剔的资深程序员，专门做 Code Review。请用尖锐、幽默且一针见血的语气指出用户代码里的愚蠢错误，然后给出优雅的重构方案。"
-    }
-
-
-def save_all_personas(personas):
-    with open(PERSONA_FILE, "w", encoding="utf-8") as f: json.dump(personas, f, ensure_ascii=False, indent=2)
-
-
-if "personas" not in st.session_state: st.session_state.personas = load_personas()
-if "active_persona" not in st.session_state: st.session_state.active_persona = "🌐 原生模式 (无预设)"
-
-
-def refresh_messages():
-    if st.session_state.session_id:
-        res = requests.get(f"{API_BASE_URL}/sessions/{st.session_state.session_id}/messages")
-        if res.status_code == 200: st.session_state.messages = res.json()
-
-
-# ==========================================
-# 🎛️ 侧边栏：配置与历史
-# ==========================================
 with st.sidebar:
-    st.markdown("### 💠 AgentNexus-J")
+    st.title("💠 AgentNexus-J")
+    st.caption("企业级多智能体协作控制台")
+    st.divider()
 
-    # 1. 引擎配置
-    with st.expander("⚙️ 引擎配置 (BYOK)", expanded=False):
-        config_keys = list(st.session_state.user_config.keys())
-        if not config_keys:
-            config_keys = ["默认模型"]
-            st.session_state.user_config = {"默认模型": {}}
+    # ── 模型配置区 ────────────────────────────────────────────────────────────
+    st.subheader("🔧 外接大模型配置")
 
-        selected_provider = st.selectbox("选择配置", config_keys + ["➕ 新增模型配置..."], label_visibility="collapsed")
-        st.divider()
+    configs: list[dict] = api("GET", "/llm-configs/", silent=True) or []
+    active_config = next((c for c in configs if c["is_active"]), None)
 
-        if selected_provider == "➕ 新增模型配置...":
-            current_name = st.text_input("给新配置起名", value="")
-            p_cfg = {}
-        else:
-            current_name = selected_provider
-            p_cfg = st.session_state.user_config.get(selected_provider, {})
-
-        user_base_url = st.text_input("Base URL", value=p_cfg.get("base_url", ""))
-        user_api_key = st.text_input("API Key", type="password", value=p_cfg.get("api_key", ""))
-        user_text_model = st.text_input("文本模型", value=p_cfg.get("text_model", ""))
-        user_vision_model = st.text_input("视觉模型", value=p_cfg.get("vision_model", ""))
-
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("💾 保存", use_container_width=True, type="primary"):
-                if not current_name.strip():
-                    st.error("不能为空！")
-                else:
-                    st.session_state.user_config[current_name] = {"base_url": user_base_url, "api_key": user_api_key,
-                                                                  "text_model": user_text_model,
-                                                                  "vision_model": user_vision_model}
-                    save_all_configs(st.session_state.user_config)
-                    st.toast("✅ 配置已保存")
-                    if selected_provider == "➕ 新增模型配置...": st.rerun()
-        with col2:
-            if selected_provider != "➕ 新增模型配置...":
-                if st.button("🗑️ 删除", use_container_width=True):
-                    del st.session_state.user_config[selected_provider]
-                    save_all_configs(st.session_state.user_config)
+    # 接入新模型（始终显示在顶部）
+    with st.expander("＋ 接入新模型", expanded=not bool(configs)):
+        with st.form("llm_config_form", clear_on_submit=True):
+            n_name = st.text_input("配置名称 *", placeholder="例：DeepSeek 生产")
+            n_model = st.text_input("模型名称 *", placeholder="例：deepseek-chat")
+            n_key = st.text_input("API Key *", type="password", placeholder="sk-...")
+            n_url = st.text_input("API URL（可选）", placeholder="留空使用 Anthropic 官方地址")
+            submitted = st.form_submit_button("💾 保存并激活", use_container_width=True, type="primary")
+        if submitted:
+            if not n_name or not n_model or not n_key:
+                st.error("配置名称、模型名称、API Key 为必填项。")
+            else:
+                result = api("POST", "/llm-configs/", json={
+                    "display_name": n_name, "model": n_model,
+                    "api_key": n_key, "base_url": n_url or None,
+                })
+                if result:
+                    st.success(f"✅ 已接入并激活：{result['display_name']}")
                     st.rerun()
 
-    # 2. 角色面具
-    with st.expander("🎭 角色面具 (System Prompts)", expanded=False):
-        persona_keys = list(st.session_state.personas.keys())
-        if not persona_keys:
-            persona_keys = ["🌐 原生模式 (无预设)"]
-            st.session_state.personas = {"🌐 原生模式 (无预设)": ""}
+    if configs:
+        options_map = {
+            f"{'✅ ' if c['is_active'] else '　 '}{c['display_name']}  ·  {c['model']}": c
+            for c in configs
+        }
+        default_idx = next((i for i, c in enumerate(configs) if c["is_active"]), 0)
+        selected_label = st.selectbox(
+            "选择模型配置",
+            options=list(options_map.keys()),
+            index=default_idx,
+            label_visibility="collapsed",
+        )
+        selected = options_map[selected_label]
 
-        c_psel, c_pdel = st.columns([5, 1])
-        with c_psel:
-            selected_persona = st.selectbox("选择当前角色", persona_keys + ["➕ 新增角色..."],
-                                            label_visibility="collapsed")
-        with c_pdel:
-            if selected_persona not in ["➕ 新增角色...", "🌐 原生模式 (无预设)"] and st.button("🗑️", key="del_p",
-                                                                                              help="删除角色"):
-                del st.session_state.personas[selected_persona]
-                save_all_personas(st.session_state.personas)
+        col_act, col_edit = st.columns(2)
+        if not selected["is_active"]:
+            if col_act.button("⚡ 激活", use_container_width=True, type="primary"):
+                api("POST", f"/llm-configs/{selected['id']}/activate")
                 st.rerun()
-        st.divider()
-
-        if selected_persona == "🌐 原生模式 (无预设)":
-            st.info("💡 当前使用大模型官方原生设定，将不会向后端发送任何系统提示词。")
-            st.session_state.active_persona = selected_persona
-        elif selected_persona == "➕ 新增角色...":
-            p_name = st.text_input("给新角色起名", value="")
-            p_content = st.text_area("System Prompt", value="", height=100)
         else:
-            p_name = selected_persona
-            p_content = st.text_area("System Prompt", value=st.session_state.personas.get(selected_persona, ""),
-                                     height=100)
-            st.session_state.active_persona = selected_persona
+            col_act.success("已激活 ✅")
 
-        if selected_persona != "🌐 原生模式 (无预设)":
-            if st.button("💾 保存角色", use_container_width=True):
-                if not p_name.strip():
-                    st.error("角色名不能为空！")
-                elif not p_content.strip():
-                    st.error("Prompt 不能为空！")
-                else:
-                    st.session_state.personas[p_name] = p_content
-                    save_all_personas(st.session_state.personas)
-                    st.toast(f"✅ 角色 [{p_name}] 已保存")
-                    st.session_state.active_persona = p_name
-                    if selected_persona == "➕ 新增角色...": st.rerun()
+        if col_edit.button("✏️ 编辑", use_container_width=True):
+            st.session_state.editing_config_id = (
+                None if st.session_state.editing_config_id == selected["id"]
+                else selected["id"]
+            )
+            st.rerun()
 
-    # ==========================================
-    # 🛸 智能体调度中心 (Orchestration)
-    # ==========================================
-    st.divider()
-    st.markdown("### 🛸 智能体调度中心")
+        # 编辑表单（行内展开）
+        if st.session_state.editing_config_id == selected["id"]:
+            with st.form(f"edit_config_{selected['id']}"):
+                st.caption(f"编辑：{selected['display_name']}")
+                e_name = st.text_input("配置名称", value=selected["display_name"])
+                e_model = st.text_input("模型名称", value=selected["model"])
+                e_key = st.text_input("API Key（留空保持不变）", type="password", placeholder="留空则不修改")
+                e_url = st.text_input(
+                    "API URL（留空清除）",
+                    value=selected.get("base_url") or "",
+                    placeholder="留空则使用官方地址",
+                )
+                s_col, c_col = st.columns(2)
+                save = s_col.form_submit_button("💾 保存", use_container_width=True, type="primary")
+                cancel = c_col.form_submit_button("取消", use_container_width=True)
 
-    config_keys = list(st.session_state.user_config.keys())
-    if not config_keys: config_keys = ["未配置模型"]
+            if save:
+                payload: dict = {}
+                if e_name.strip():
+                    payload["display_name"] = e_name
+                if e_model.strip():
+                    payload["model"] = e_model
+                if e_key.strip():
+                    payload["api_key"] = e_key
+                payload["base_url"] = e_url.strip() or ""
+                result = api("PATCH", f"/llm-configs/{selected['id']}", json=payload)
+                if result:
+                    st.session_state.editing_config_id = None
+                    st.rerun()
+            if cancel:
+                st.session_state.editing_config_id = None
+                st.rerun()
 
-    enable_swarm = st.toggle("🌌 启用多智能体协作网络", value=False, help="开启后可同时调度多个大模型进行深度逻辑博弈。")
-
-    swarm_mode = None
-    selected_providers = []
-    node_tools_map = {}
-
-    # 初始化测试工具
-    if not st.session_state.custom_tools:
-        st.session_state.custom_tools = [{
-            "name": "get_system_time",
-            "description": "获取当前服务器的精确时间和日期",
-            "parameters": {"type": "object", "properties": {}},
-            "url": ""
-        }]
-
-    if not enable_swarm:
-        selected_single = st.selectbox("当前主脑 (单模型极速响应)", config_keys)
-        selected_providers = [selected_single]
-        st.caption("ℹ️ 单机直连：适合日常对话、代码补全与基础问答。")
-    else:
-        st.markdown("##### ⚙️ 舰队编排")
-        selected_providers = st.multiselect(
-            "选择出战模型 (1~5个，首个为裁判)", config_keys, default=[config_keys[0]] if config_keys else None,
-            max_selections=5
+        st.caption(
+            f"Key: `{selected['api_key_masked']}`"
+            + (f"  ·  `{selected['base_url']}`" if selected.get("base_url") else "")
         )
 
-        if len(selected_providers) > 1:
-            swarm_mode_label = st.radio("⚔️ 选择多智能体战术阵型",
-                                        ["👑 主从迭代 (Maker-Checker)", "🎪 圆桌会议 (Roundtable)"])
-            swarm_mode = "maker_checker" if "主从" in swarm_mode_label else "roundtable"
-
-            if st.session_state.custom_tools:
-                with st.expander("🧰 异构工具分配 (为不同模型配置专属能力)"):
-                    st.caption("让专业模型做专业的事，传递纯文本工具名称以减轻网络负担。")
-                    tool_names = [t.get("name") for t in st.session_state.custom_tools if t.get("name")]
-                    for i, p_name in enumerate(selected_providers):
-                        default_sel = tool_names if i == 0 else []
-                        selected_t_names = st.multiselect(f"[{p_name}] 的专属工具箱", options=tool_names,
-                                                          default=default_sel, key=f"tool_alloc_{p_name}")
-                        node_tools_map[p_name] = selected_t_names
-        elif len(selected_providers) == 1:
-            st.warning("⚠️ 舰队目前仅有一艘船，将自动降级为单兵模式。")
-        else:
-            st.error("⚠️ 请至少编排一个模型！")
-
-    if st.button("✨ 开启新工作流", use_container_width=True, type="primary"):
-        active_provider = selected_providers[0] if selected_providers else "未知模型"
-        res = requests.post(f"{API_BASE_URL}/sessions/", json={"title": "新会话", "model_provider": active_provider})
-        if res.status_code == 200:
-            st.session_state.session_id = res.json()["id"]
-            st.session_state.messages = []
-            st.session_state.pending_action = None
-            st.rerun()
-
+    # ── System Prompt 库 ──────────────────────────────────────────────────────
     st.divider()
-    with st.expander("📄 投喂本地文档", expanded=True):
-        uploaded_file = st.file_uploader("支持 TXT/MD/LOG/PY", type=["txt", "md", "log", "py", "csv", "json"],
-                                         label_visibility="collapsed")
-        if uploaded_file and st.session_state.get("last_sent_file_id") != uploaded_file.file_id:
-            try:
-                st.session_state.file_content = uploaded_file.read().decode("utf-8")
-                st.session_state.file_name = uploaded_file.name
-                st.success("✅ 文件就绪")
-            except:
-                st.error("编码错误")
-        elif not uploaded_file:
-            st.session_state.file_content = None
+    st.subheader("📋 System Prompt 库")
 
-    st.divider()
-    st.markdown("🕒 **历史任务**")
-    h_res = requests.get(f"{API_BASE_URL}/sessions/")
-    if h_res.status_code == 200:
-        for s in h_res.json():
-            is_active = (s['id'] == st.session_state.session_id)
-            c_main, c_edit, c_del = st.columns([6, 2, 2])
-            with c_main:
-                if st.button(f"{'▶' if is_active else '💬'} {s['title'][:12]}", key=f"s_{s['id']}",
-                             use_container_width=True):
-                    st.session_state.session_id = s['id']
-                    st.session_state.pending_action = None
-                    refresh_messages()
-                    st.rerun()
-            with c_edit:
-                if st.button("✏️", key=f"edit_{s['id']}"):
-                    st.session_state.rename_id = s['id']
-                    st.rerun()
-            with c_del:
-                if st.button("🗑️", key=f"del_{s['id']}"):
-                    requests.delete(f"{API_BASE_URL}/sessions/{s['id']}")
-                    if is_active: st.session_state.session_id = None
-                    st.rerun()
+    sp_list: list[dict] = api("GET", "/system-prompts/", silent=True) or []
 
-    if st.session_state.rename_id:
-        new_title = st.text_input("输入新名称并回车", key="rename_input")
-        if new_title:
-            requests.patch(f"{API_BASE_URL}/sessions/{st.session_state.rename_id}", params={"title": new_title})
-            st.session_state.rename_id = None
-            st.rerun()
+    # 新建提示词
+    with st.expander("＋ 新建提示词"):
+        with st.form("new_sp_form", clear_on_submit=True):
+            sp_new_name = st.text_input("名称 *", placeholder="例：客服助手")
+            sp_new_content = st.text_area("内容 *", height=100,
+                                          placeholder="在此输入 System Prompt 内容...")
+            if st.form_submit_button("💾 保存", use_container_width=True, type="primary"):
+                if sp_new_name.strip() and sp_new_content.strip():
+                    r = api("POST", "/system-prompts/",
+                            json={"name": sp_new_name.strip(), "content": sp_new_content.strip()})
+                    if r:
+                        st.session_state.selected_sp_id = r["id"]
+                        st.rerun()
+                else:
+                    st.warning("名称和内容均为必填。")
 
-# ==========================================
-# 💬 主界面：对话与流式渲染
-# ==========================================
-if not st.session_state.session_id: st.info("👈 请从左侧边栏开启新工作流。"); st.stop()
+    if sp_list:
+        sp_options = {"（不使用）": None} | {sp["name"]: sp["id"] for sp in sp_list}
+        current_sp_name = next(
+            (sp["name"] for sp in sp_list if sp["id"] == st.session_state.selected_sp_id),
+            "（不使用）",
+        )
+        selected_sp_name = st.selectbox(
+            "选择提示词",
+            options=list(sp_options.keys()),
+            index=list(sp_options.keys()).index(current_sp_name),
+            label_visibility="collapsed",
+        )
+        st.session_state.selected_sp_id = sp_options[selected_sp_name]
 
-refresh_messages()
-for msg in st.session_state.messages:
-    if msg["role"] == "user" and ("[系统汇报" in msg["content"] or "🔧" in msg["content"]):
-        with st.chat_message("system", avatar="⚙️"):
-            with st.expander("🛠️ 系统工具执行详情"): st.code(msg["content"], language="bash")
+        selected_sp = next((sp for sp in sp_list if sp["id"] == st.session_state.selected_sp_id), None)
+
+        if selected_sp:
+            # 预览内容
+            st.caption(selected_sp["content"][:120] + ("…" if len(selected_sp["content"]) > 120 else ""))
+
+            # 编辑 / 删除
+            col_sp_edit, col_sp_del = st.columns(2)
+            if col_sp_edit.button("✏️ 编辑", key="sp_edit_btn", use_container_width=True):
+                st.session_state.editing_sp_id = (
+                    None if st.session_state.editing_sp_id == selected_sp["id"]
+                    else selected_sp["id"]
+                )
+                st.rerun()
+            if col_sp_del.button("🗑 删除", key="sp_del_btn", use_container_width=True):
+                api("DELETE", f"/system-prompts/{selected_sp['id']}")
+                st.session_state.selected_sp_id = None
+                st.session_state.editing_sp_id = None
+                st.rerun()
+
+            if st.session_state.editing_sp_id == selected_sp["id"]:
+                with st.form(f"edit_sp_{selected_sp['id']}"):
+                    e_sp_name = st.text_input("名称", value=selected_sp["name"])
+                    e_sp_content = st.text_area("内容", value=selected_sp["content"], height=100)
+                    ec1, ec2 = st.columns(2)
+                    if ec1.form_submit_button("💾 保存", use_container_width=True, type="primary"):
+                        patch: dict = {}
+                        if e_sp_name.strip():
+                            patch["name"] = e_sp_name.strip()
+                        if e_sp_content.strip():
+                            patch["content"] = e_sp_content.strip()
+                        if patch:
+                            api("PATCH", f"/system-prompts/{selected_sp['id']}", json=patch)
+                        st.session_state.editing_sp_id = None
+                        st.rerun()
+                    if ec2.form_submit_button("取消", use_container_width=True):
+                        st.session_state.editing_sp_id = None
+                        st.rerun()
+
+        # 应用到当前会话
+        if st.session_state.active_session_id:
+            if st.button("✅ 应用到当前会话", use_container_width=True, type="primary"):
+                sp_id = st.session_state.selected_sp_id
+                if sp_id:
+                    api("PATCH", f"/sessions/{st.session_state.active_session_id}",
+                        json={"system_prompt_id": sp_id})
+                else:
+                    api("PATCH", f"/sessions/{st.session_state.active_session_id}",
+                        json={"clear_system_prompt": True})
+                st.rerun()
     else:
-        avatar = "🧑‍💻" if msg["role"] == "user" else "✨"
-        with st.chat_message(msg["role"], avatar=avatar):
-            st.markdown(msg["content"])
+        st.caption("暂无提示词，点击上方新建。")
 
-# 🛑 拦截器 1：高危操作授权请求
-if st.session_state.pending_action:
-    with st.chat_message("assistant", avatar="✨"):
-        st.error("🚨 **高危操作授权请求**")
-        t_name = st.session_state.pending_action.get("name")
-        t_args = st.session_state.pending_action.get("args")
-        st.code(t_args, language="json")
-        col1, col2 = st.columns(2)
+    # ── 会话列表区 ────────────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("💬 会话列表")
 
-        btn_payload = st.session_state.interrupted_payload.copy() if st.session_state.interrupted_payload else {}
-        if col1.button("✅ 允许", type="primary", use_container_width=True):
-            btn_payload.update({"action": "approve_tool", "pending_tool_name": t_name, "pending_tool_args": t_args})
-            st.session_state.run_stream = btn_payload
-            st.session_state.pending_action = None
-            st.rerun()
-        if col2.button("🚫 拒绝", use_container_width=True):
-            btn_payload.update({"action": "reject_tool", "pending_tool_name": t_name, "pending_tool_args": t_args})
-            st.session_state.run_stream = btn_payload
-            st.session_state.pending_action = None
-            st.rerun()
+    if st.button("＋ 新建会话", use_container_width=True, type="primary"):
+        if not active_config:
+            st.error("请先配置并激活一个模型。")
+        else:
+            sp_id = st.session_state.get("selected_sp_id")
+            result = api("POST", "/sessions/", json={
+                "title": "新会话",
+                "system_prompt_id": sp_id,
+            })
+            if result:
+                st.session_state.active_session_id = result["id"]
+                st.session_state.chat_history = []
+                st.rerun()
 
-# 🛑 拦截器 2：按需加载本地模型
-if st.session_state.get("pending_model_install"):
-    m_name = st.session_state.pending_model_install
-    with st.chat_message("assistant", avatar="⚙️"):
-        st.warning(
-            f"💡 **系统提示：按需加载本地神经中枢**\n\n为激活高级多智能体记忆压缩特性，系统需要挂载轻量级本地大脑 `{m_name}`。这将占用少量本地资源。")
-        c1, c2 = st.columns(2)
-        if c1.button("✅ 同意并自动安装 (推荐)", type="primary", use_container_width=True):
-            btn_payload = st.session_state.interrupted_payload.copy()
-            btn_payload["action"] = "pull_local_model"
-            st.session_state.run_stream = btn_payload
-            st.session_state.pending_model_install = None
-            st.rerun()
-        if c2.button("🚫 暂不安装 (退回)", use_container_width=True):
-            st.session_state.pending_model_install = None
-            st.session_state.interrupted_payload = None
-            st.rerun()
+    sessions: list[dict] = api("GET", "/sessions/", silent=True) or []
 
+    # 重命名弹出框（在列表上方）
+    if st.session_state.renaming_session_id:
+        rid = st.session_state.renaming_session_id
+        target = next((s for s in sessions if s["id"] == rid), None)
+        if target:
+            with st.form("rename_form"):
+                new_title = st.text_input("新名称", value=target["title"])
+                rc1, rc2 = st.columns(2)
+                if rc1.form_submit_button("确认", use_container_width=True, type="primary"):
+                    if new_title.strip():
+                        api("PATCH", f"/sessions/{rid}", json={"title": new_title})
+                    st.session_state.renaming_session_id = None
+                    st.rerun()
+                if rc2.form_submit_button("取消", use_container_width=True):
+                    st.session_state.renaming_session_id = None
+                    st.rerun()
 
-def handle_streaming_request(payload):
-    full_response = ""
-    with st.chat_message("assistant", avatar="✨"):
-        status_placeholder = st.empty()
-        text_placeholder = st.empty()
-        progress_bar = st.empty()
+    for s in sessions:
+        is_current = s["id"] == st.session_state.active_session_id
+        col_name, col_ren, col_del = st.columns([5, 1, 1])
 
-        try:
-            with requests.post(f"{API_BASE_URL}/sessions/{st.session_state.session_id}/chat", json=payload,
-                               stream=True) as r:
-                if r.status_code != 200:
-                    st.error(f"后端报错 (HTTP {r.status_code}): {r.text}")
-                    return
-                for line in r.iter_lines():
-                    if line:
-                        decoded = line.decode('utf-8')
-                        if decoded.startswith('data: '):
-                            data = json.loads(decoded[6:])
-                            if data['type'] == 'status':
-                                status_placeholder.info(f"🌀 {data['content']}")
-                            elif data['type'] == 'chunk':
-                                full_response += data['content']
-                                text_placeholder.markdown(full_response + "▌")
-                            elif data['type'] == 'requires_action':
-                                st.session_state.pending_action = {"name": data['name'], "args": data['args']}
-                                st.session_state.interrupted_payload = payload
-                                st.rerun()
-                            elif data['type'] == 'error':
-                                st.error(data['content'])
-                                return
-                            elif data['type'] == 'requires_local_model':
-                                st.session_state.pending_model_install = data['model_name']
-                                st.session_state.interrupted_payload = payload
-                                st.rerun()
-                            elif data['type'] == 'pull_progress':
-                                total = data.get('total', 1)
-                                completed = data.get('completed', 0)
-                                if total > 1 and completed > 0:
-                                    pct = min(completed / total, 1.0)
-                                    progress_bar.progress(pct,
-                                                          text=f"📥 正在挂载 {data.get('status')}... {int(pct * 100)}%")
-                                else:
-                                    status_placeholder.info(f"⏳ {data.get('status')}...")
-                            elif data['type'] == 'pull_success':
-                                progress_bar.empty()
-                                status_placeholder.success("✅ 本地中枢挂载完毕！正在继续执行原任务...")
-                                import time;
-                                time.sleep(1)
-                                st.session_state.run_stream = st.session_state.interrupted_payload
-                                st.rerun()
+        with col_name:
+            label = ("▶ " if is_current else "") + s["title"]
+            if st.button(label, key=f"s_{s['id']}", use_container_width=True):
+                st.session_state.active_session_id = s["id"]
+                st.session_state.selected_sp_id = s.get("system_prompt_id")
+                st.session_state.chat_history = [
+                    {"role": m["role"], "content": m["content"] or ""}
+                    for m in s.get("messages", [])
+                    if m["role"] in ("user", "assistant")
+                ]
+                st.rerun()
 
-            status_placeholder.empty()
-            text_placeholder.markdown(full_response)
-            if uploaded_file: st.session_state.last_sent_file_id = uploaded_file.file_id
-            refresh_messages()
-        except Exception as e:
-            st.error(f"连接异常: {e}")
+        with col_ren:
+            if st.button("✏️", key=f"r_{s['id']}", help="重命名"):
+                st.session_state.renaming_session_id = (
+                    None if st.session_state.renaming_session_id == s["id"] else s["id"]
+                )
+                st.rerun()
 
+        with col_del:
+            if st.button("🗑", key=f"d_{s['id']}", help="删除"):
+                api("DELETE", f"/sessions/{s['id']}")
+                if s["id"] == st.session_state.active_session_id:
+                    st.session_state.active_session_id = None
+                    st.session_state.chat_history = []
+                st.rerun()
 
-if "run_stream" in st.session_state:
-    p = st.session_state.pop("run_stream")
-    handle_streaming_request(p)
-    st.rerun()
+# ── 主区域：对话界面 ───────────────────────────────────────────────────────────
 
-is_disabled = bool(st.session_state.get("pending_action")) or bool(st.session_state.get("pending_model_install"))
+if not st.session_state.active_session_id:
+    st.markdown(
+        """
+        <div style='text-align:center;padding:80px 0'>
+            <h1>💠 AgentNexus-J</h1>
+            <p style='font-size:1.1rem;color:#888'>
+                企业级多智能体协作系统<br>
+                ← 先在左侧配置模型，再新建或选择会话
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.stop()
 
-if prompt := st.chat_input("输入指令...", disabled=is_disabled):
-    if not selected_providers:
-        st.error("请先在侧边栏选择至少一个模型！")
+# 顶部标题栏
+session_data = api("GET", f"/sessions/{st.session_state.active_session_id}", silent=True)
+if session_data:
+    col_title, col_model = st.columns([6, 1])
+    with col_title:
+        st.subheader(session_data["title"])
+        sp_ref = session_data.get("system_prompt_ref")
+        if sp_ref:
+            st.caption(f"📋 System Prompt：`{sp_ref['name']}`")
+    with col_model:
+        model_label = active_config["model"] if active_config else "未配置"
+        st.caption(f"`{model_label}`")
+
+st.divider()
+
+# 渲染历史消息
+for msg in st.session_state.chat_history:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+# ── 对话输入 ──────────────────────────────────────────────────────────────────
+
+if prompt := st.chat_input("发送消息给 AgentNexus-J..."):
+    if not active_config:
+        st.error("请先在左侧配置并激活一个模型。")
         st.stop()
 
-    with st.chat_message("user", avatar="🧑‍💻"):
+    st.session_state.chat_history.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
         st.markdown(prompt)
 
-    # 🌟 精确组装 Swarm 节点，仅传递工具名称
-    swarm_nodes = []
-    for p_name in selected_providers:
-        cfg = st.session_state.user_config.get(p_name, {})
-        if not swarm_mode:
-            assigned = [t.get("name") for t in st.session_state.custom_tools if t.get("name")]
-        else:
-            assigned = node_tools_map.get(p_name, [])
-        swarm_nodes.append({
-            "provider_name": p_name,
-            "api_key": cfg.get("api_key", ""),
-            "base_url": cfg.get("base_url", ""),
-            "text_model": cfg.get("text_model", ""),
-            "assigned_tools": assigned
-        })
+    with st.chat_message("assistant"):
+        reply = st.write_stream(
+            stream_chat(st.session_state.active_session_id, prompt)
+        )
 
-    primary = swarm_nodes[0]
-    sys_prompt_val = st.session_state.personas.get(st.session_state.active_persona, "")
-
-    # 🌟 严丝合缝的 payload 组装，不漏任何一个参数
-    payload = {
-        "action": "chat",
-        "user_input": prompt,
-        "api_key": primary["api_key"],
-        "base_url": primary["base_url"],
-        "text_model": primary["text_model"],
-        "vision_model": st.session_state.user_config.get(primary["provider_name"], {}).get("vision_model", ""),
-        "custom_tools": st.session_state.custom_tools,  # 这里必须传完整的工具对象列表，供后端全局注册
-        "file_name": st.session_state.get("file_name"),
-        "file_content": st.session_state.get("file_content"),
-        "system_prompt": sys_prompt_val,
-        "swarm_mode": swarm_mode,
-        "swarm_nodes": swarm_nodes
-    }
-
-    handle_streaming_request(payload)
+    if reply:
+        st.session_state.chat_history.append({"role": "assistant", "content": reply})
     st.rerun()
