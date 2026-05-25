@@ -130,6 +130,46 @@ class SessionOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+# ── UserTool ──────────────────────────────────────────────────────────────────
+
+class UserToolCreate(BaseModel):
+    name: str = Field(..., pattern=r"^[a-z][a-z0-9_]{1,98}$",
+                      description="snake_case 函数名，供 LLM 调用")
+    display_name: str = Field(..., min_length=1, max_length=100)
+    description: str = Field(..., min_length=1)
+    parameters_schema: dict = Field(default_factory=lambda: {"type": "object", "properties": {}})
+    http_url: str = Field(..., min_length=1)
+    http_method: str = Field(default="POST", pattern=r"^(GET|POST)$")
+    http_headers: dict | None = None
+
+
+class UserToolUpdate(BaseModel):
+    display_name: str | None = None
+    description: str | None = None
+    parameters_schema: dict | None = None
+    http_url: str | None = None
+    http_method: str | None = None
+    http_headers: dict | None = None
+    is_active: bool | None = None
+
+
+class UserToolOut(BaseModel):
+    id: uuid.UUID
+    name: str
+    display_name: str
+    description: str
+    parameters_schema: dict
+    tool_type: str
+    http_url: str | None
+    http_method: str
+    http_headers: dict | None
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
 # ── Chat ──────────────────────────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):

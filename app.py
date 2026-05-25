@@ -2,181 +2,61 @@
 
 import json
 from datetime import datetime
+from pathlib import Path
 
 import httpx
 import streamlit as st
+import streamlit.components.v1 as stcomp
 
-# ── 自动主题（白天 < 18:00 用亮色，之后用暗色）────────────────────────────────
+# ── 自动主题：运行时写 config.toml，由 Streamlit 原生主题引擎渲染 ──────────────
 
-_NIGHT_CSS = """
-<style>
-/* ══ AgentNexus-J 夜间主题 ══ */
+_CONFIG_PATH = Path(".streamlit/config.toml")
 
-/* 主背景 */
-.stApp {
-    background-color: #0E1117 !important;
+_TOML = {
+    "dark": """\
+[theme]
+base = "dark"
+primaryColor = "#5B6EFF"
+backgroundColor = "#0E1117"
+secondaryBackgroundColor = "#1A1D27"
+textColor = "#FAFAFA"
+
+[server]
+port = 8501
+headless = true
+
+[browser]
+gatherUsageStats = false
+""",
+    "light": """\
+[theme]
+base = "light"
+primaryColor = "#5B6EFF"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F0F2F6"
+textColor = "#31333F"
+
+[server]
+port = 8501
+headless = true
+
+[browser]
+gatherUsageStats = false
+""",
 }
 
-/* 顶部装饰条 */
+# 品牌装饰条 + 亮色模式对比度修复（不依赖 base）
+_BRAND_CSS = """
+<style>
 [data-testid="stDecoration"] {
     background-image: linear-gradient(90deg, #5B6EFF, #8B5CF6) !important;
-}
-
-/* 侧边栏 */
-section[data-testid="stSidebar"] > div:first-child {
-    background-color: #1A1D27 !important;
-}
-
-/* 通用文字 */
-.stApp p, .stApp span, .stApp label,
-.stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp h6,
-.stMarkdown p, .stMarkdown li,
-[data-testid="stText"] {
-    color: #FAFAFA !important;
-}
-[data-testid="stCaptionContainer"] p,
-.stCaption {
-    color: #9095A5 !important;
-}
-
-/* 输入框 & 文本域 */
-.stTextInput input,
-.stTextArea textarea,
-[data-baseweb="input"] input {
-    background-color: #262730 !important;
-    color: #FAFAFA !important;
-    border-color: #3D4051 !important;
-}
-[data-baseweb="base-input"] {
-    background-color: #262730 !important;
-}
-
-/* 下拉选择框 */
-[data-baseweb="select"] > div:first-child {
-    background-color: #262730 !important;
-    border-color: #3D4051 !important;
-    color: #FAFAFA !important;
-}
-[data-baseweb="select"] span,
-[data-baseweb="select"] div {
-    color: #FAFAFA !important;
-}
-[data-baseweb="menu"] {
-    background-color: #262730 !important;
-    border-color: #3D4051 !important;
-}
-[data-baseweb="menu"] li {
-    color: #FAFAFA !important;
-}
-[data-baseweb="menu"] li:hover,
-[data-baseweb="menu"] [aria-selected="true"] {
-    background-color: #3A3D50 !important;
-}
-
-/* 普通按钮 */
-.stButton > button {
-    background-color: #262730 !important;
-    color: #FAFAFA !important;
-    border-color: #3D4051 !important;
-}
-.stButton > button:hover {
-    background-color: #3A3D50 !important;
-    border-color: #5B6EFF !important;
-    color: #FFFFFF !important;
-}
-
-/* Primary 按钮保持品牌色 */
-.stButton > button[kind="primary"] {
-    background-color: #5B6EFF !important;
-    border-color: #5B6EFF !important;
-    color: #FFFFFF !important;
-}
-.stButton > button[kind="primary"]:hover {
-    background-color: #4A5AE8 !important;
-    border-color: #4A5AE8 !important;
-}
-
-/* 表单容器 */
-[data-testid="stForm"] {
-    border-color: #3D4051 !important;
-    background-color: transparent !important;
-}
-
-/* Expander */
-[data-testid="stExpander"] details {
-    background-color: #1A1D27 !important;
-    border-color: #3D4051 !important;
-}
-[data-testid="stExpander"] summary,
-[data-testid="stExpander"] summary span {
-    color: #FAFAFA !important;
-}
-
-/* Chat 消息气泡 */
-[data-testid="stChatMessage"] {
-    background-color: #1A1D27 !important;
-}
-[data-testid="stChatMessageContent"] p {
-    color: #FAFAFA !important;
-}
-
-/* Radio & Checkbox */
-[data-testid="stRadio"] label p,
-[data-testid="stCheckbox"] label p {
-    color: #FAFAFA !important;
-}
-
-/* 分割线 */
-hr {
-    border-color: #3D4051 !important;
-}
-
-/* 行内代码 */
-code {
-    background-color: #262730 !important;
-    color: #C4A8FF !important;
-}
-
-/* 成功 / 错误 / 警告横幅 */
-[data-testid="stNotification"][data-baseweb="notification"] {
-    background-color: #1A1D27 !important;
-}
-div[data-testid="stAlert"][kind="success"] {
-    background-color: #0B2318 !important;
-    color: #6EE7B7 !important;
-}
-div[data-testid="stAlert"][kind="error"] {
-    background-color: #2B0D0D !important;
-    color: #FCA5A5 !important;
-}
-div[data-testid="stAlert"][kind="warning"] {
-    background-color: #2B1D00 !important;
-    color: #FCD34D !important;
-}
-
-/* 聊天输入框 */
-[data-testid="stChatInput"] textarea {
-    background-color: #262730 !important;
-    color: #FAFAFA !important;
-    border-color: #3D4051 !important;
-}
-[data-testid="stChatInputContainer"] {
-    background-color: #1A1D27 !important;
-    border-color: #3D4051 !important;
 }
 </style>
 """
 
-_DAY_CSS = """
+_LIGHT_FIX_CSS = """
 <style>
-/* ══ AgentNexus-J 白天主题 ══ */
-
-/* 顶部品牌装饰条 */
-[data-testid="stDecoration"] {
-    background-image: linear-gradient(90deg, #5B6EFF, #8B5CF6) !important;
-}
-
-/* 成功提示（已激活）— 深绿文字 + 浅薄荷底 */
+/* 成功提示：深绿文字 + 薄荷底，提升对比度 */
 div[data-testid="stAlert"][kind="success"],
 div.stSuccess > div {
     background-color: #D1FAE5 !important;
@@ -188,16 +68,13 @@ div.stSuccess > div p,
 div.stSuccess > div span {
     color: #065F46 !important;
 }
-
-/* Caption 中的 inline code（Key / URL 展示） */
+/* Caption 中 inline code */
 [data-testid="stCaptionContainer"] code {
     background-color: #EFF6FF !important;
     color: #1E40AF !important;
     border-radius: 4px !important;
     padding: 1px 4px !important;
 }
-
-/* Caption 普通文字 */
 [data-testid="stCaptionContainer"] p {
     color: #4B5563 !important;
 }
@@ -205,9 +82,31 @@ div.stSuccess > div span {
 """
 
 
-def _inject_theme() -> None:
-    hour = datetime.now().hour
-    st.markdown(_NIGHT_CSS if hour >= 18 else _DAY_CSS, unsafe_allow_html=True)
+def _apply_theme() -> None:
+    """
+    检查当前时间，将 config.toml 设置为对应主题。
+    若配置与目标不符，更新文件后触发浏览器刷新（由 Streamlit 原生主题接管）。
+    """
+    desired = "dark" if datetime.now().hour >= 18 else "light"
+    try:
+        current = _CONFIG_PATH.read_text(encoding="utf-8")
+    except OSError:
+        current = ""
+
+    if f'base = "{desired}"' not in current:
+        try:
+            _CONFIG_PATH.write_text(_TOML[desired], encoding="utf-8")
+        except OSError:
+            pass
+        # 触发浏览器硬刷新，让 Streamlit 以新 config.toml 重新渲染
+        stcomp.html('<script>window.parent.location.reload()</script>', height=0)
+        st.stop()
+
+    # 主题已正确，注入品牌 CSS
+    st.markdown(_BRAND_CSS, unsafe_allow_html=True)
+    if desired == "light":
+        st.markdown(_LIGHT_FIX_CSS, unsafe_allow_html=True)
+
 
 API_BASE = "http://localhost:8000/api/v1"
 
@@ -217,7 +116,7 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
-_inject_theme()
+_apply_theme()
 
 # ── HTTP 工具 ──────────────────────────────────────────────────────────────────
 
@@ -264,10 +163,27 @@ def stream_chat(session_id: str, message: str):
             if ptype == "text":
                 yield payload["content"]
             elif ptype == "tool_start":
-                tools = "、".join(payload.get("tools", []))
-                yield f"\n\n> 🔧 调用工具：{tools}...\n\n"
+                tool_info = payload.get("tool_info", [])
+                blocks: list[str] = []
+                for ti in tool_info:
+                    name = ti.get("name", "")
+                    inp = ti.get("input", {})
+                    if name == "execute_terminal":
+                        cmd = inp.get("command", "")
+                        wd = inp.get("working_dir", "")
+                        header = f"🖥 **执行命令**" + (f"  `{wd}`" if wd else "")
+                        blocks.append(f"{header}\n```shell\n{cmd}\n```")
+                    else:
+                        label = {
+                            "get_system_time": "🕐 获取系统时间",
+                        }.get(name, f"🔧 {name}")
+                        blocks.append(label)
+                yield "\n\n" + "\n\n".join(blocks) + "\n\n"
             elif ptype == "tool_end":
-                yield "\n\n"
+                results = payload.get("results", [])
+                if results:
+                    combined = "\n---\n".join(str(r) for r in results)
+                    yield f"```\n{combined}\n```\n\n"
             elif ptype == "error":
                 yield f"\n\n❌ {payload.get('message', '未知错误')}"
 
@@ -281,6 +197,7 @@ for _k, _v in [
     ("renaming_session_id", None),
     ("selected_sp_id", None),       # 当前侧边栏选中的 system prompt id
     ("editing_sp_id", None),        # 正在编辑的 system prompt id
+    ("editing_tool_id", None),      # 正在编辑的 HTTP 工具 id
 ]:
     if _k not in st.session_state:
         st.session_state[_k] = _v
@@ -473,6 +390,134 @@ with st.sidebar:
                 st.rerun()
     else:
         st.caption("暂无提示词，点击上方新建。")
+
+    # ── 工具管理区 ────────────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("🛠 工具管理")
+
+    all_tools: list[dict] = api("GET", "/tools/", silent=True) or []
+
+    # 接入新 HTTP 工具
+    with st.expander("＋ 接入新工具"):
+        with st.form("new_tool_form", clear_on_submit=True):
+            t_name = st.text_input("工具标识符 *", placeholder="snake_case，如 search_web")
+            t_display = st.text_input("显示名称 *", placeholder="如 Web 搜索")
+            t_desc = st.text_area("功能描述 *", height=70,
+                                  placeholder="向大模型说明这个工具的用途和触发条件")
+            t_url = st.text_input("接口地址 *", placeholder="https://your-api.com/endpoint")
+            t_method = st.selectbox("请求方式", ["POST", "GET"])
+            t_headers = st.text_area("请求头（JSON，可选）", height=50,
+                                     placeholder='{"Authorization": "Bearer token"}')
+            t_schema = st.text_area(
+                "参数定义（JSON Schema）",
+                height=100,
+                value='{\n  "type": "object",\n  "properties": {\n    "query": {"type": "string", "description": "查询内容"}\n  },\n  "required": ["query"]\n}',
+            )
+            if st.form_submit_button("💾 保存工具", use_container_width=True, type="primary"):
+                errors = []
+                if not t_name.strip():
+                    errors.append("工具标识符不能为空")
+                if not t_display.strip():
+                    errors.append("显示名称不能为空")
+                if not t_desc.strip():
+                    errors.append("功能描述不能为空")
+                if not t_url.strip():
+                    errors.append("接口地址不能为空")
+                headers_dict = None
+                if t_headers.strip():
+                    try:
+                        headers_dict = json.loads(t_headers)
+                    except json.JSONDecodeError:
+                        errors.append("请求头 JSON 格式错误")
+                schema_dict = {"type": "object", "properties": {}}
+                if t_schema.strip():
+                    try:
+                        schema_dict = json.loads(t_schema)
+                    except json.JSONDecodeError:
+                        errors.append("参数定义 JSON 格式错误")
+                if errors:
+                    for e in errors:
+                        st.error(e)
+                else:
+                    r = api("POST", "/tools/", json={
+                        "name": t_name.strip(),
+                        "display_name": t_display.strip(),
+                        "description": t_desc.strip(),
+                        "http_url": t_url.strip(),
+                        "http_method": t_method,
+                        "http_headers": headers_dict,
+                        "parameters_schema": schema_dict,
+                    })
+                    if r:
+                        st.success(f"✅ 工具 '{t_display.strip()}' 已接入")
+                        st.rerun()
+
+    # 工具列表
+    if all_tools:
+        for t in all_tools:
+            is_builtin = t["tool_type"] == "builtin"
+            badge = "🔵 内置" if is_builtin else "🟠 HTTP"
+            col_badge, col_name, col_toggle, *col_rest = st.columns(
+                [1.2, 4, 1.2] + ([1, 1] if not is_builtin else [])
+            )
+            col_badge.caption(badge)
+            col_name.markdown(f"**{t['display_name']}**  \n`{t['name']}`")
+            # 开关
+            active = col_toggle.toggle(
+                "启用",
+                value=t["is_active"],
+                key=f"tool_toggle_{t['id']}",
+                label_visibility="collapsed",
+            )
+            if active != t["is_active"]:
+                api("PATCH", f"/tools/{t['id']}/toggle")
+                st.rerun()
+            # HTTP 工具：编辑 + 删除
+            if not is_builtin and col_rest:
+                col_edit, col_del = col_rest
+                if col_edit.button("✏️", key=f"te_{t['id']}", help="编辑"):
+                    st.session_state.editing_tool_id = (
+                        None if st.session_state.get("editing_tool_id") == t["id"] else t["id"]
+                    )
+                    st.rerun()
+                if col_del.button("🗑", key=f"td_{t['id']}", help="删除"):
+                    api("DELETE", f"/tools/{t['id']}")
+                    st.rerun()
+            # 编辑表单（行内展开）
+            if st.session_state.get("editing_tool_id") == t["id"]:
+                with st.form(f"edit_tool_{t['id']}"):
+                    et_display = st.text_input("显示名称", value=t["display_name"])
+                    et_desc = st.text_area("描述", value=t["description"], height=70)
+                    et_url = st.text_input("接口地址", value=t.get("http_url") or "")
+                    et_method = st.selectbox("请求方式", ["POST", "GET"],
+                                             index=0 if t.get("http_method", "POST") == "POST" else 1)
+                    et_schema = st.text_area(
+                        "参数定义（JSON Schema）",
+                        value=json.dumps(t.get("parameters_schema") or {}, ensure_ascii=False, indent=2),
+                        height=80,
+                    )
+                    ec1, ec2 = st.columns(2)
+                    if ec1.form_submit_button("💾 保存", use_container_width=True, type="primary"):
+                        patch: dict = {
+                            "display_name": et_display.strip() or None,
+                            "description": et_desc.strip() or None,
+                            "http_url": et_url.strip() or None,
+                            "http_method": et_method,
+                        }
+                        try:
+                            patch["parameters_schema"] = json.loads(et_schema)
+                        except json.JSONDecodeError:
+                            st.error("参数定义 JSON 格式错误")
+                            st.stop()
+                        patch = {k: v for k, v in patch.items() if v is not None}
+                        api("PATCH", f"/tools/{t['id']}", json=patch)
+                        st.session_state.editing_tool_id = None
+                        st.rerun()
+                    if ec2.form_submit_button("取消", use_container_width=True):
+                        st.session_state.editing_tool_id = None
+                        st.rerun()
+    else:
+        st.caption("暂无工具，重启后端后内置工具将自动同步。")
 
     # ── 会话列表区 ────────────────────────────────────────────────────────────
     st.divider()

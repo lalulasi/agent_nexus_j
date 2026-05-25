@@ -5,12 +5,16 @@ from collections.abc import AsyncGenerator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sqlalchemy import select as sa_select
+
 from api.app.core.config import get_settings
 from api.app.core.logger import logger
 from api.app.domain.schemas import ChatResponse, MessageOut
-from api.app.infrastructure.database.models import AgentSession, LLMConfig, Message
+from api.app.infrastructure.database.models import AgentSession, LLMConfig, Message, UserTool
 from api.app.infrastructure.llm.adapters import StreamTurn, make_adapter
-from api.app.infrastructure.tools.registry import get_tool, list_tools
+from api.app.infrastructure.tools.base import BaseTool
+from api.app.infrastructure.tools.http_tool import HttpTool
+from api.app.infrastructure.tools.registry import get_tool
 
 settings = get_settings()
 
@@ -18,23 +22,49 @@ settings = get_settings()
 class AgentOrchestrator:
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
-        self.tools = [t.to_anthropic_tool() for t in list_tools()]
+        self._tool_defs: list[dict] = []       # LLM 用的工具定义（Anthropic 格式）
+        self._executors: dict[str, BaseTool] = {}  # name → 可执行实例
+
+    # ── 工具加载（每次请求从 DB 读取激活工具） ────────────────────────────────
+
+    async def _load_tools(self) -> None:
+        result = await self.db.execute(
+            sa_select(UserTool).where(UserTool.is_active == True)
+        )
+        records = result.scalars().all()
+        defs, executors = [], {}
+        for r in records:
+            defs.append({
+                "name": r.name,
+                "description": r.description,
+                "input_schema": r.parameters_schema or {"type": "object", "properties": {}},
+            })
+            if r.tool_type == "builtin":
+                builtin = get_tool(r.name)
+                if builtin:
+                    executors[r.name] = builtin
+            elif r.tool_type == "http" and r.http_url:
+                executors[r.name] = HttpTool(r)
+        self._tool_defs = defs
+        self._executors = executors
+        logger.debug(f"已加载工具: {list(executors.keys())}")
 
     # ── 普通调用 ──────────────────────────────────────────────────────────────
 
     async def run(self, session: AgentSession, user_message: str) -> ChatResponse:
+        await self._load_tools()
         config = await self._get_active_config()
-        adapter = make_adapter(config, self.tools)
+        adapter = make_adapter(config, self._tool_defs)
 
         await self._save_message(session.id, "user", user_message)
         messages = adapter.format_history(self._build_history(session, user_message))
         system = session.system_prompt_ref.content if session.system_prompt_ref else None
-
         final_text, usage = await self._loop(adapter, messages, system)
 
         saved = await self._save_message(
             session.id, "assistant", final_text, token_count=usage.get("output_tokens")
         )
+        await self._auto_title(session, user_message, adapter)
         return ChatResponse(
             session_id=session.id,
             message=MessageOut.model_validate(saved),
@@ -49,7 +79,8 @@ class AgentOrchestrator:
         user_message: str,
         config: LLMConfig,
     ) -> AsyncGenerator[str, None]:
-        adapter = make_adapter(config, self.tools)
+        await self._load_tools()
+        adapter = make_adapter(config, self._tool_defs)
 
         await self._save_message(session.id, "user", user_message)
         messages = adapter.format_history(self._build_history(session, user_message))
@@ -86,16 +117,17 @@ class AgentOrchestrator:
 
             if turn.stop_reason == "tool_use":
                 tool_names = [tc.name for tc in turn.tool_calls]
-                yield json.dumps({"type": "tool_start", "tools": tool_names})
+                tool_info = [{"name": tc.name, "input": tc.input} for tc in turn.tool_calls]
+                yield json.dumps({"type": "tool_start", "tools": tool_names, "tool_info": tool_info})
                 logger.info(f"调用工具: {tool_names}")
 
                 tool_outputs: dict[str, str] = {}
                 results: list[str] = []
                 for tc in turn.tool_calls:
-                    tool = get_tool(tc.name)
-                    if tool:
+                    executor = self._executors.get(tc.name)
+                    if executor:
                         try:
-                            result = await tool.run(**tc.input)
+                            result = await executor.run(**tc.input)
                         except Exception as e:
                             result = f"工具执行错误: {e}"
                     else:
@@ -118,6 +150,7 @@ class AgentOrchestrator:
             session.id, "assistant", final_text,
             token_count=last_usage.get("output_tokens"),
         )
+        await self._auto_title(session, user_message, adapter)
         yield json.dumps({"type": "done", "usage": last_usage})
 
     # ── 内部：非流式循环 ──────────────────────────────────────────────────────
@@ -141,8 +174,11 @@ class AgentOrchestrator:
             if turn.stop_reason == "tool_use":
                 tool_outputs: dict[str, str] = {}
                 for tc in turn.tool_calls:
-                    tool = get_tool(tc.name)
-                    result = await tool.run(**tc.input) if tool else f"未知工具: {tc.name}"
+                    executor = self._executors.get(tc.name)
+                    try:
+                        result = await executor.run(**tc.input) if executor else f"未知工具: {tc.name}"
+                    except Exception as e:
+                        result = f"工具执行错误: {e}"
                     tool_outputs[tc.id] = str(result)
                 messages = adapter.add_tool_turn(messages, turn, tool_outputs)
                 continue
@@ -150,6 +186,31 @@ class AgentOrchestrator:
             return turn.text, usage_total
 
         return "已达最大迭代次数。", usage_total
+
+    # ── 自动命名 ──────────────────────────────────────────────────────────────
+
+    async def _auto_title(self, session: AgentSession, user_message: str, adapter) -> None:
+        if session.title != "新会话":
+            return
+        try:
+            # 使用无工具 adapter，避免模型对命名 prompt 发起工具调用
+            naming_adapter = make_adapter(adapter.config, [])
+            msgs = naming_adapter.format_history([{
+                "role": "user",
+                "content": (
+                    "根据下面这条用户消息，为对话生成一个简洁的中文标题。"
+                    "要求：10字以内，只输出标题文字本身，不加引号、标点或任何解释。\n\n"
+                    + user_message[:300]
+                ),
+            }])
+            turn = await naming_adapter.complete(msgs, None, 30)
+            title = turn.text.strip().strip("\"'《》「」【】<>").strip()[:30]
+            if title:
+                session.title = title
+                await self.db.flush()
+                logger.info(f"自动命名会话 {session.id}：{title}")
+        except Exception:
+            logger.warning("自动命名失败，保持默认标题")
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

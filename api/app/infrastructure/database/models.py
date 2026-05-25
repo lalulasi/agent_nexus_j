@@ -65,6 +65,27 @@ class AgentSession(Base):
     system_prompt_ref: Mapped["SystemPrompt | None"] = relationship("SystemPrompt", lazy="selectin")
 
 
+class UserTool(Base):
+    """用户管理的工具表：内置工具（builtin）和自定义 HTTP 工具（http）。"""
+
+    __tablename__ = "user_tools"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
+    display_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    parameters_schema: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    tool_type: Mapped[str] = mapped_column(String(20), nullable=False, default="http")  # builtin | http
+    http_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    http_method: Mapped[str] = mapped_column(String(10), nullable=False, default="POST")
+    http_headers: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class Message(Base):
     __tablename__ = "messages"
 

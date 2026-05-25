@@ -34,6 +34,7 @@ class StreamTurn:
     tool_calls: list[ToolCall] = field(default_factory=list)
     stop_reason: str = "end_turn"
     usage: dict = field(default_factory=dict)
+    reasoning_content: str = ""  # DeepSeek thinking 模式，必须原样传回 API
 
 
 StreamItem = Union[str, StreamTurn]
@@ -203,6 +204,7 @@ class OpenAIAdapter(BaseLLMAdapter):
             kwargs["tools"] = self.openai_tools
 
         text = ""
+        reasoning_text = ""
         pending: dict[int, dict] = {}
         usage: dict = {}
         finish_reason: str | None = None
@@ -212,6 +214,10 @@ class OpenAIAdapter(BaseLLMAdapter):
             choice = chunk.choices[0] if chunk.choices else None
             if choice:
                 delta = choice.delta
+                # reasoning_content：DeepSeek 推理模型思考阶段，不向用户输出
+                rc = getattr(delta, "reasoning_content", None)
+                if rc:
+                    reasoning_text += rc
                 if delta.content:
                     text += delta.content
                     yield delta.content
@@ -249,6 +255,7 @@ class OpenAIAdapter(BaseLLMAdapter):
             tool_calls=tool_calls,
             stop_reason="tool_use" if finish_reason == "tool_calls" else "end_turn",
             usage=usage,
+            reasoning_content=reasoning_text,
         )
 
     async def complete(self, messages, system, max_tokens):
@@ -264,6 +271,7 @@ class OpenAIAdapter(BaseLLMAdapter):
         resp = await self.client.chat.completions.create(**kwargs)
         choice = resp.choices[0]
         text = choice.message.content or ""
+        rc = getattr(choice.message, "reasoning_content", None) or ""
         tool_calls = []
         if choice.message.tool_calls:
             for tc in choice.message.tool_calls:
@@ -274,22 +282,23 @@ class OpenAIAdapter(BaseLLMAdapter):
                 tool_calls.append(ToolCall(id=tc.id, name=tc.function.name, input=input_data))
 
         return StreamTurn(
-            text=text,
+            text=text or rc,  # reasoning-only 模型 content 为空时用 thinking 兜底
             tool_calls=tool_calls,
             stop_reason="tool_use" if choice.finish_reason == "tool_calls" else "end_turn",
             usage={
                 "input_tokens": resp.usage.prompt_tokens if resp.usage else 0,
                 "output_tokens": resp.usage.completion_tokens if resp.usage else 0,
             },
+            reasoning_content=rc,
         )
 
     def format_history(self, history: list[dict]) -> list[dict]:
         return history  # {role, content} 格式一致
 
     def add_tool_turn(self, messages, turn, tool_outputs):
-        assistant_msg: dict = {"role": "assistant"}
-        if turn.text:
-            assistant_msg["content"] = turn.text
+        assistant_msg: dict = {"role": "assistant", "content": turn.text or None}
+        if turn.reasoning_content:
+            assistant_msg["reasoning_content"] = turn.reasoning_content
         if turn.tool_calls:
             assistant_msg["tool_calls"] = [
                 {
