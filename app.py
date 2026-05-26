@@ -1,5 +1,6 @@
 """AgentNexus-J — Streamlit 控制台"""
 
+import base64
 import json
 from datetime import datetime
 from pathlib import Path
@@ -139,12 +140,22 @@ def api(method: str, path: str, silent: bool = False, **kwargs):
     return None
 
 
-def stream_chat(session_id: str, message: str):
+def stream_chat(
+    session_id: str,
+    message: str,
+    attachments: list[dict] | None = None,
+    is_retry: bool = False,
+):
     """同步生成器，供 st.write_stream() 消费（普通会话）。"""
     with httpx.stream(
         "POST",
         f"{API_BASE}/chat/stream",
-        json={"session_id": session_id, "message": message},
+        json={
+            "session_id": session_id,
+            "message": message,
+            "attachments": attachments or [],
+            "is_retry": is_retry,
+        },
         timeout=180,
     ) as resp:
         if resp.status_code != 200:
@@ -185,8 +196,28 @@ def stream_chat(session_id: str, message: str):
                 if results:
                     combined = "\n---\n".join(str(r) for r in results)
                     yield f"```\n{combined}\n```\n\n"
+            elif ptype == "rag_context":
+                chunks = payload.get("chunks", [])
+                if chunks:
+                    lines = [f"📚 **已从知识库检索到 {len(chunks)} 条相关内容**\n"]
+                    for c in chunks:
+                        snippet = c["content"][:150].replace("\n", " ")
+                        lines.append(f"> **{c['filename']}** · 相关度 {c['score']:.2f}\n> {snippet}…\n")
+                    yield "\n".join(lines) + "\n---\n\n"
+            elif ptype == "compression":
+                st.session_state["_compression_happened"] = True
             elif ptype == "error":
-                yield f"\n\n❌ {payload.get('message', '未知错误')}"
+                raw_err = payload.get("message", "未知错误")
+                _vision_keywords = ("vision", "image", "BalanceError", "multimodal",
+                                    "no suitable services", "不支持图片", "visual")
+                if any(k.lower() in raw_err.lower() for k in _vision_keywords):
+                    yield (
+                        f"\n\n❌ 模型不支持图片（视觉功能）。\n\n"
+                        f"> 请切换到视觉模型，例如：Claude 3+、GPT-4o、qwen-vl-max 等。\n\n"
+                        f"原始错误：`{raw_err}`"
+                    )
+                else:
+                    yield f"\n\n❌ {raw_err}"
 
 
 def _iter_collab_events(session_id: str, message: str):
@@ -360,9 +391,37 @@ for _k, _v in [
     ("collab_show_form", False),           # 是否展开协作会话创建表单
     ("active_session_collab_mode", None),  # 当前活跃会话的协作模式
     ("last_collab_process", []),           # 最近一次协作过程事件，用于持久显示
+    ("_upload_generation", 0),             # 递增以重置文件上传器
+    ("_last_prompt", ""),                  # 最近一次用户消息（用于重试）
+    ("_last_attachments", []),             # 最近一次附件（用于重试）
+    ("_retry_pending", False),             # 是否触发重试
 ]:
     if _k not in st.session_state:
         st.session_state[_k] = _v
+
+# fastembed 支持的嵌入模型列表（key=显示名, value=model_id）
+_EMB_OPTIONS: dict[str, str | None] = {
+    "🏠 默认：bge-small-zh-v1.5（512 维 · 中文 · 90 MB）":     None,
+    "BAAI/bge-base-zh-v1.5（768 维 · 中文 · 210 MB）":         "BAAI/bge-base-zh-v1.5",
+    "jinaai/jina-embeddings-v2-base-zh（768 维 · 中英 · 640 MB）": "jinaai/jina-embeddings-v2-base-zh",
+    "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2（384 维 · 50+ 语言 · 220 MB）":
+        "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+    "nomic-ai/nomic-embed-text-v1.5-Q（768 维 · 多语言量化 · 130 MB）":
+        "nomic-ai/nomic-embed-text-v1.5-Q",
+    "BAAI/bge-small-en-v1.5（384 维 · 英文 · 67 MB）":          "BAAI/bge-small-en-v1.5",
+    "BAAI/bge-base-en-v1.5（768 维 · 英文 · 210 MB）":          "BAAI/bge-base-en-v1.5",
+    "BAAI/bge-m3（1024 维 · 多语言 · 570 MB）":                 "BAAI/bge-m3",
+}
+_EMB_LABELS = list(_EMB_OPTIONS.keys())
+
+def _emb_label(model_id: str | None) -> str:
+    """根据 model_id 找到对应的显示名，找不到则返回第一项（默认）。"""
+    if not model_id:
+        return _EMB_LABELS[0]
+    for label, mid in _EMB_OPTIONS.items():
+        if mid == model_id:
+            return label
+    return _EMB_LABELS[0]
 
 # ── 侧边栏 ────────────────────────────────────────────────────────────────────
 
@@ -384,6 +443,13 @@ with st.sidebar:
             n_model = st.text_input("模型名称 *", placeholder="例：deepseek-chat")
             n_key = st.text_input("API Key *", type="password", placeholder="sk-...")
             n_url = st.text_input("API URL（可选）", placeholder="留空使用 Anthropic 官方地址")
+            n_emb_label = st.selectbox(
+                "嵌入模型（用于 RAG 知识库）",
+                options=_EMB_LABELS,
+                index=0,
+                help="首次选择非默认模型时，后端会从 HuggingFace 下载 ONNX 文件并缓存本地，之后离线可用。",
+            )
+            n_emb_model = _EMB_OPTIONS[n_emb_label]
             submitted = st.form_submit_button("💾 保存并激活", use_container_width=True, type="primary")
         if submitted:
             if not n_name or not n_model or not n_key:
@@ -392,6 +458,7 @@ with st.sidebar:
                 result = api("POST", "/llm-configs/", json={
                     "display_name": n_name, "model": n_model,
                     "api_key": n_key, "base_url": n_url or None,
+                    "embedding_model": n_emb_model,
                 })
                 if result:
                     st.success(f"✅ 已接入并激活：{result['display_name']}")
@@ -438,6 +505,14 @@ with st.sidebar:
                     value=selected.get("base_url") or "",
                     placeholder="留空则使用官方地址",
                 )
+                _cur_emb_label = _emb_label(selected.get("embedding_model"))
+                e_emb_label = st.selectbox(
+                    "嵌入模型",
+                    options=_EMB_LABELS,
+                    index=_EMB_LABELS.index(_cur_emb_label),
+                    help="首次选择非默认模型时，后端从 HuggingFace 下载 ONNX 文件并缓存本地。",
+                )
+                e_emb_model = _EMB_OPTIONS[e_emb_label]
                 s_col, c_col = st.columns(2)
                 save = s_col.form_submit_button("💾 保存", use_container_width=True, type="primary")
                 cancel = c_col.form_submit_button("取消", use_container_width=True)
@@ -451,6 +526,8 @@ with st.sidebar:
                 if e_key.strip():
                     payload["api_key"] = e_key
                 payload["base_url"] = e_url.strip() or ""
+                # 发送空字符串让后端清除；发送 None 后端会当"不修改"跳过
+                payload["embedding_model"] = e_emb_model or ""  # "" 触发后端清除为 NULL
                 result = api("PATCH", f"/llm-configs/{selected['id']}", json=payload)
                 if result:
                     st.session_state.editing_config_id = None
@@ -459,10 +536,12 @@ with st.sidebar:
                 st.session_state.editing_config_id = None
                 st.rerun()
 
-        st.caption(
-            f"Key: `{selected['api_key_masked']}`"
-            + (f"  ·  `{selected['base_url']}`" if selected.get("base_url") else "")
-        )
+        _cap_parts = [f"Key: `{selected['api_key_masked']}`"]
+        if selected.get("base_url"):
+            _cap_parts.append(f"`{selected['base_url']}`")
+        if selected.get("embedding_model"):
+            _cap_parts.append(f"Emb: `{selected['embedding_model']}`")
+        st.caption("  ·  ".join(_cap_parts))
 
     # ── System Prompt 库 ──────────────────────────────────────────────────────
     st.divider()
@@ -681,18 +760,69 @@ with st.sidebar:
     else:
         st.caption("暂无工具，重启后端后内置工具将自动同步。")
 
+    # ── 知识库管理 ────────────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("📚 知识库")
+
+    _ext_emb = active_config.get("embedding_model") if active_config else None
+    if _ext_emb:
+        st.caption(f"🔌 外部嵌入：`{_ext_emb}`")
+    else:
+        st.caption("🏠 内置本地模型：`bge-small-zh-v1.5`（中文优化，512 维，无需 API）")
+
+    with st.expander("＋ 上传文档"):
+        _kb_file = st.file_uploader(
+            "选择文件",
+            key="kb_file_upload",
+            type=["pdf", "docx", "doc", "xlsx", "xls", "txt", "md", "csv", "py", "js", "ts", "json"],
+            label_visibility="collapsed",
+        )
+        if _kb_file:
+            if st.button("📤 上传到知识库", use_container_width=True, type="primary", key="kb_upload_btn"):
+                with st.spinner("正在处理并嵌入文档，请稍候..."):
+                    _kb_file.seek(0)
+                    _kb_result = api(
+                        "POST", "/knowledge/upload",
+                        files={"file": (_kb_file.name, _kb_file.read(), _kb_file.type or "application/octet-stream")},
+                    )
+                if _kb_result:
+                    st.success(f"✅ {_kb_result['filename']}（{_kb_result['chunk_count']} 块）")
+                    st.rerun()
+
+    _kb_docs: list[dict] = api("GET", "/knowledge/", silent=True) or []
+    if _kb_docs:
+        for _doc in _kb_docs:
+            _dc1, _dc2, _dc3 = st.columns([5, 1.5, 1])
+            _dc1.markdown(f"📄 **{_doc['filename']}**")
+            _dc2.caption(f"{_doc['chunk_count']} 块")
+            if _dc3.button("🗑", key=f"kb_del_{_doc['id']}", help="删除"):
+                api("DELETE", f"/knowledge/{_doc['id']}")
+                st.rerun()
+    else:
+        st.caption("知识库为空，上传文档后可在会话中启用 RAG。")
+
     # ── 会话列表区 ────────────────────────────────────────────────────────────
     st.divider()
     st.subheader("💬 会话列表")
 
     # 普通新建
     col_new, col_collab = st.columns(2)
+    _rag_new_toggle = st.checkbox(
+        "🔍 启用 RAG",
+        key="rag_new_session",
+        value=False,
+        help="新会话开启知识库检索（使用内置本地嵌入模型，无需额外配置）",
+    )
     if col_new.button("＋ 普通会话", use_container_width=True, type="primary"):
         if not active_config:
             st.error("请先配置并激活一个模型。")
         else:
             sp_id = st.session_state.get("selected_sp_id")
-            result = api("POST", "/sessions/", json={"title": "新会话", "system_prompt_id": sp_id})
+            result = api("POST", "/sessions/", json={
+                "title": "新会话",
+                "system_prompt_id": sp_id,
+                "rag_enabled": _rag_new_toggle,
+            })
             if result:
                 st.session_state.active_session_id = result["id"]
                 st.session_state.active_session_collab_mode = None
@@ -819,16 +949,21 @@ with st.sidebar:
     for s in sessions:
         is_current = s["id"] == st.session_state.active_session_id
         collab_badge = "⚡ " if s.get("collab_mode") else ""
+        rag_badge = "🔍 " if s.get("rag_enabled") else ""
         col_name, col_ren, col_del = st.columns([5, 1, 1])
 
         with col_name:
-            label = ("▶ " if is_current else "") + collab_badge + s["title"]
+            label = ("▶ " if is_current else "") + collab_badge + rag_badge + s["title"]
             if st.button(label, key=f"s_{s['id']}", use_container_width=True):
                 st.session_state.active_session_id = s["id"]
                 st.session_state.active_session_collab_mode = s.get("collab_mode")
                 st.session_state.selected_sp_id = s.get("system_prompt_id")
                 st.session_state.chat_history = [
-                    {"role": m["role"], "content": m["content"] or ""}
+                    {
+                        "role": m["role"],
+                        "content": m["content"] or "",
+                        "attachments": m.get("attachments") or [],
+                    }
                     for m in s.get("messages", [])
                     if m["role"] in ("user", "assistant")
                 ]
@@ -877,8 +1012,10 @@ if session_data:
     col_title, col_model = st.columns([6, 1])
     with col_title:
         collab_mode = session_data.get("collab_mode")
+        _rag_active = session_data.get("rag_enabled", False)
         title_prefix = {"round_table": "⚡ 圆桌 · ", "master_slave": "⚡ 主从 · "}.get(collab_mode or "", "")
-        st.subheader(title_prefix + session_data["title"])
+        rag_prefix = "🔍 RAG · " if _rag_active else ""
+        st.subheader(title_prefix + rag_prefix + session_data["title"])
         sp_ref = session_data.get("system_prompt_ref")
         if sp_ref:
             st.caption(f"📋 System Prompt：`{sp_ref['name']}`")
@@ -899,14 +1036,13 @@ st.divider()
 _history = st.session_state.chat_history
 _last_collab = st.session_state.get("last_collab_process", [])
 
+_copy_content: str | None = None
+
 for i, msg in enumerate(_history):
+    _is_last_assistant = msg["role"] == "assistant" and i == len(_history) - 1
     with st.chat_message(msg["role"]):
         # 最后一条 assistant 消息：若有协作过程数据，显示在答案上方
-        if (
-            msg["role"] == "assistant"
-            and i == len(_history) - 1
-            and _last_collab
-        ):
+        if _is_last_assistant and _last_collab:
             _has_reviewer    = any(e.get("type") == "collab_reviewer_result" for e in _last_collab)
             _has_round_table = any(e.get("type") == "collab_model_result"    for e in _last_collab)
             if _has_reviewer:
@@ -914,63 +1050,153 @@ for i, msg in enumerate(_history):
             elif _has_round_table:
                 with st.expander("🔄 协作决策过程", expanded=False):
                     _render_round_table_process(_last_collab)
+        # 附件预览
+        for _att in (msg.get("attachments") or []):
+            if _att.get("type") == "image":
+                _img_bytes = base64.b64decode(_att["data"])
+                st.image(_img_bytes, caption=_att.get("filename", ""), width=320)
+            else:
+                st.caption(f"📄 {_att.get('filename', '文件')}")
         st.markdown(msg["content"])
+
+    # ── 最后一条 assistant 消息下方：重试 / 复制按钮 ──────────────────────────
+    if _is_last_assistant:
+        _ab1, _ab2, _ = st.columns([0.065, 0.065, 0.87])
+        with _ab1:
+            _retry_disabled = bool(st.session_state.get("active_session_collab_mode"))
+            if st.button(
+                "",
+                icon=":material/replay:",
+                key="btn_retry",
+                help="重新生成" if not _retry_disabled else "协作模式暂不支持重试",
+                disabled=_retry_disabled,
+            ):
+                if _history and _history[-1]["role"] == "assistant":
+                    st.session_state.chat_history.pop()
+                st.session_state.last_collab_process = []
+                st.session_state._retry_pending = True
+                st.rerun()
+        with _ab2:
+            if st.button(
+                "",
+                icon=":material/content_copy:",
+                key="btn_copy",
+                help="复制回答",
+            ):
+                _copy_content = msg["content"]
+
+# 复制触发：通过 JS 写入剪贴板
+if _copy_content:
+    stcomp.html(
+        f"<script>window.parent.navigator.clipboard.writeText("
+        f"{json.dumps(_copy_content)});</script>",
+        height=0,
+    )
+    st.toast("✅ 已复制到剪贴板")
 
 # ── 对话输入 ──────────────────────────────────────────────────────────────────
 
 _is_collab = bool(st.session_state.get("active_session_collab_mode"))
 _hint = "发送消息给协作团队..." if _is_collab else "发送消息给 AgentNexus-J..."
 
-if prompt := st.chat_input(_hint):
+# 消费重试标志（在渲染 chat_input 之前）
+_is_retry = st.session_state.pop("_retry_pending", False)
+_effective_prompt: str | None = None
+_effective_attachments: list[dict] = []
+
+if _is_retry:
+    _effective_prompt    = st.session_state.get("_last_prompt", "")
+    _effective_attachments = st.session_state.get("_last_attachments", [])
+
+# 文件上传器（协作模式不支持附件）
+_uploaded_files: list = []
+if not _is_collab and st.session_state.active_session_id:
+    _uploaded_files = st.file_uploader(
+        "附件",
+        accept_multiple_files=True,
+        key=f"file_up_{st.session_state._upload_generation}",
+        type=["jpg", "jpeg", "png", "gif", "webp", "pdf",
+              "docx", "doc", "xlsx", "xls", "txt", "md", "csv",
+              "py", "js", "ts", "json", "yaml", "yml"],
+        label_visibility="collapsed",
+        help="支持图片 / PDF / Office / 文本文件。上传图片需要模型具备视觉能力（Vision），"
+             "如 Claude 3+、GPT-4o、qwen-vl-max 等，文本类文件对所有模型适用。",
+    ) or []
+
+# 新消息输入
+_input_prompt = st.chat_input(_hint)
+if _input_prompt and not _is_retry:
+    _effective_prompt = _input_prompt
+    for _f in _uploaded_files:
+        _f.seek(0)
+        _effective_attachments.append({
+            "filename": _f.name,
+            "mime_type": _f.type or "application/octet-stream",
+            "data": base64.b64encode(_f.read()).decode(),
+        })
+    if _effective_attachments:
+        st.session_state["_upload_generation"] += 1
+
+if _effective_prompt:
     if not _is_collab and not active_config:
         st.error("请先在左侧配置并激活一个模型。")
         st.stop()
 
-    # 新消息到来：清除上一次的协作过程（用户已看完）
-    st.session_state.last_collab_process = []
-    st.session_state.chat_history.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+    reply: str = ""
+
+    if not _is_retry:
+        # 存储供下次重试使用
+        st.session_state._last_prompt      = _effective_prompt
+        st.session_state._last_attachments = _effective_attachments
+        st.session_state.last_collab_process = []
+        # 追加用户消息到历史并即时显示
+        st.session_state.chat_history.append({
+            "role": "user",
+            "content": _effective_prompt,
+            "attachments": _effective_attachments,
+        })
+        with st.chat_message("user"):
+            for _att in _effective_attachments:
+                if _att["mime_type"].startswith("image/"):
+                    st.image(base64.b64decode(_att["data"]), caption=_att["filename"], width=320)
+                else:
+                    st.caption(f"📄 {_att['filename']}")
+            st.markdown(_effective_prompt)
 
     if _is_collab:
         with st.chat_message("assistant"):
             # ── 实时展示区域 ──────────────────────────────────────────────────
-            phase_ph   = st.empty()   # 当前阶段说明
-            live_ph    = st.empty()   # 主模型流式文字 / 最终答案流式文字
-            score_ph   = st.empty()   # 评委进度（每完成一个更新一次）
+            phase_ph   = st.empty()
+            live_ph    = st.empty()
+            score_ph   = st.empty()
 
             process_events: list[dict] = []
             final_text_parts: list[str] = []
-            master_text_live  = ""
-            final_text_live   = ""
-            reviewer_live: list[str] = []   # 已完成的评委摘要行
+            master_text_live = ""
+            reviewer_live: list[str] = []
 
-            for ev in _iter_collab_events(st.session_state.active_session_id, prompt):
+            for ev in _iter_collab_events(st.session_state.active_session_id, _effective_prompt):
                 t = ev.get("type", "")
 
-                # ── 阶段提示 ──────────────────────────────────────────────────
                 if t == "collab_phase":
                     phase_ph.info(f"⚡ {ev.get('label', '')}...")
                     process_events.append(ev)
 
-                # ── 主模型流式文字（主从专用）────────────────────────────────
                 elif t == "collab_model_text" and ev.get("role") == "master":
                     master_text_live += ev.get("content", "")
                     live_ph.markdown(master_text_live + "▌")
                     process_events.append(ev)
 
                 elif t == "collab_model_end" and ev.get("role") == "master":
-                    live_ph.markdown(master_text_live)   # 去掉光标
+                    live_ph.markdown(master_text_live)
                     process_events.append(ev)
 
-                # ── 圆桌：某模型本轮回答完成 ─────────────────────────────────
                 elif t == "collab_model_result":
                     role_label = ev.get("role_label", ev.get("role", ""))
                     model_name = ev.get("model_name", "")
                     phase_ph.info(f"✅ {role_label}（{model_name}）完成")
                     process_events.append(ev)
 
-                # ── 主从：某评委评审完成 ──────────────────────────────────────
                 elif t == "collab_reviewer_result":
                     model_name = ev.get("model_name", "")
                     total      = ev.get("weighted_total", 0)
@@ -981,17 +1207,14 @@ if prompt := st.chat_input(_hint):
                     score_ph.markdown("\n\n---\n\n".join(reviewer_live))
                     process_events.append(ev)
 
-                # ── 综合者开始 ────────────────────────────────────────────────
                 elif t == "collab_synthesis_start":
                     phase_ph.info(f"🔀 综合者（{ev.get('model_name','')}）正在输出最终答案...")
-                    live_ph.empty()    # 清空主模型文字，准备显示最终答案
+                    live_ph.empty()
                     process_events.append(ev)
 
-                # ── 最终答案流式文字 ──────────────────────────────────────────
                 elif t == "text":
                     final_text_parts.append(ev.get("content", ""))
-                    final_text_live = "".join(final_text_parts)
-                    live_ph.markdown(final_text_live + "▌")
+                    live_ph.markdown("".join(final_text_parts) + "▌")
 
                 elif t == "error":
                     phase_ph.error(ev.get("message", "未知错误"))
@@ -1000,14 +1223,11 @@ if prompt := st.chat_input(_hint):
                 elif t == "done":
                     break
 
-            # ── 流结束：清除实时占位符，渲染最终结果 ─────────────────────────
             phase_ph.empty()
             live_ph.empty()
             score_ph.empty()
 
             final_text = "".join(final_text_parts)
-
-            # 持久化协作过程到 session_state（下一条用户消息到来前保持可见）
             st.session_state.last_collab_process = process_events
 
             has_reviewer    = any(e.get("type") == "collab_reviewer_result" for e in process_events)
@@ -1026,10 +1246,18 @@ if prompt := st.chat_input(_hint):
 
             reply = final_text
     else:
+        st.session_state["_compression_happened"] = False
         with st.chat_message("assistant"):
             reply = st.write_stream(
-                stream_chat(st.session_state.active_session_id, prompt)
+                stream_chat(
+                    st.session_state.active_session_id,
+                    _effective_prompt,
+                    _effective_attachments,
+                    is_retry=_is_retry,
+                )
             )
+        if st.session_state.pop("_compression_happened", False):
+            st.toast("✂️ 对话历史已自动压缩以节省上下文空间", icon="💡")
 
     if reply:
         st.session_state.chat_history.append({"role": "assistant", "content": reply})

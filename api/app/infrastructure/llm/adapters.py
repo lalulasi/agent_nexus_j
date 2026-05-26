@@ -154,7 +154,32 @@ class AnthropicAdapter(BaseLLMAdapter):
         )
 
     def format_history(self, history: list[dict]) -> list[dict]:
-        return history  # Anthropic 格式与内部格式相同
+        result = []
+        for msg in history:
+            atts = msg.get("attachments") or []
+            if not atts:
+                result.append({"role": msg["role"], "content": msg.get("content") or ""})
+                continue
+            blocks: list[dict] = []
+            for att in atts:
+                if att.get("type") == "image":
+                    blocks.append({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": att["mime_type"],
+                            "data": att["data"],
+                        },
+                    })
+                else:
+                    blocks.append({
+                        "type": "text",
+                        "text": f"[文件: {att['filename']}]\n{att.get('extracted_text', '')}",
+                    })
+            if msg.get("content"):
+                blocks.append({"type": "text", "text": msg["content"]})
+            result.append({"role": msg["role"], "content": blocks})
+        return result
 
     def add_tool_turn(self, messages, turn, tool_outputs):
         assistant_content = []
@@ -293,7 +318,28 @@ class OpenAIAdapter(BaseLLMAdapter):
         )
 
     def format_history(self, history: list[dict]) -> list[dict]:
-        return history  # {role, content} 格式一致
+        result = []
+        for msg in history:
+            atts = msg.get("attachments") or []
+            if not atts:
+                result.append({"role": msg["role"], "content": msg.get("content") or ""})
+                continue
+            parts: list[dict] = []
+            for att in atts:
+                if att.get("type") == "image":
+                    parts.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{att['mime_type']};base64,{att['data']}"},
+                    })
+                else:
+                    parts.append({
+                        "type": "text",
+                        "text": f"[文件: {att['filename']}]\n{att.get('extracted_text', '')}",
+                    })
+            if msg.get("content"):
+                parts.append({"type": "text", "text": msg["content"]})
+            result.append({"role": msg["role"], "content": parts})
+        return result
 
     def add_tool_turn(self, messages, turn, tool_outputs):
         assistant_msg: dict = {"role": "assistant", "content": turn.text or None}

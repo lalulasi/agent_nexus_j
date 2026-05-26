@@ -37,6 +37,8 @@ class Settings(BaseSettings):
     # Agent
     agent_max_tokens: int = 8192
     agent_max_iterations: int = 20
+    agent_compress_threshold: int = 3000
+    agent_compress_keep_recent: int = 6
 
     @property
     def is_development(self) -> bool:

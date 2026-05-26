@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from sqlalchemy import select as sa_select
 
+from api.app.application.rag_pipeline import RAGPipeline
 from api.app.core.config import get_settings
 from api.app.core.logger import logger
 from api.app.domain.schemas import ChatResponse, MessageOut
@@ -49,6 +50,17 @@ class AgentOrchestrator:
         self._executors = executors
         logger.debug(f"已加载工具: {list(executors.keys())}")
 
+    # ── RAG 检索 ──────────────────────────────────────────────────────────────
+
+    async def _retrieve_rag(self, user_message: str, config: LLMConfig) -> list[dict]:
+        """当 session.rag_enabled 时检索知识库，返回 top-k 切片列表。"""
+        try:
+            pipeline = RAGPipeline(self.db, config)
+            return await pipeline.query(user_message)
+        except Exception as e:
+            logger.warning(f"RAG 检索失败，跳过: {e}")
+            return []
+
     # ── 普通调用 ──────────────────────────────────────────────────────────────
 
     async def run(self, session: AgentSession, user_message: str) -> ChatResponse:
@@ -58,7 +70,7 @@ class AgentOrchestrator:
 
         await self._save_message(session.id, "user", user_message)
         messages = adapter.format_history(self._build_history(session, user_message))
-        system = session.system_prompt_ref.content if session.system_prompt_ref else None
+        system = self._get_effective_system(session)
         final_text, usage = await self._loop(adapter, messages, system)
 
         saved = await self._save_message(
@@ -78,13 +90,41 @@ class AgentOrchestrator:
         session: AgentSession,
         user_message: str,
         config: LLMConfig,
+        attachments: list[dict] | None = None,
+        is_retry: bool = False,
     ) -> AsyncGenerator[str, None]:
         await self._load_tools()
         adapter = make_adapter(config, self._tool_defs)
 
-        await self._save_message(session.id, "user", user_message)
-        messages = adapter.format_history(self._build_history(session, user_message))
-        system = session.system_prompt_ref.content if session.system_prompt_ref else None
+        if not is_retry:
+            await self._save_message(
+                session.id, "user", user_message, attachments=attachments or []
+            )
+
+        compressed = await self._maybe_compress(session, config)
+        if compressed:
+            await self.db.refresh(session, ["messages"])
+            yield json.dumps({"type": "compression"})
+
+        messages = adapter.format_history(
+            self._build_history(
+                session,
+                user_message,
+                already_in_messages=is_retry or compressed,
+                new_attachments=attachments or [],
+            )
+        )
+        system = self._get_effective_system(session)
+
+        # RAG：检索相关切片并注入 system prompt
+        if session.rag_enabled:
+            rag_chunks = await self._retrieve_rag(user_message, config)
+            if rag_chunks:
+                rag_block = "\n\n---\n以下是从知识库中检索到的相关内容，请参考：\n" + "\n\n".join(
+                    f"[来源: {c['filename']}]\n{c['content']}" for c in rag_chunks
+                )
+                system = (system or "") + rag_block
+                yield json.dumps({"type": "rag_context", "chunks": rag_chunks})
 
         final_text = ""
         last_usage: dict = {}
@@ -224,14 +264,110 @@ class AgentOrchestrator:
             raise ValueError("尚未配置模型，请先在左侧面板保存模型配置。")
         return config
 
-    def _build_history(self, session: AgentSession, new_msg: str) -> list[dict]:
+    def _build_history(
+        self,
+        session: AgentSession,
+        new_msg: str,
+        already_in_messages: bool = False,
+        new_attachments: list[dict] | None = None,
+    ) -> list[dict]:
+        last_summary_idx = -1
+        for i, m in enumerate(session.messages):
+            if m.role == "summary":
+                last_summary_idx = i
+        msgs_to_use = session.messages[last_summary_idx + 1:]
         history = [
-            {"role": m.role, "content": m.content}
-            for m in session.messages
+            {
+                "role": m.role,
+                "content": m.content,
+                "attachments": m.attachments or [],
+            }
+            for m in msgs_to_use
+            if m.role in ("user", "assistant") and (m.content or m.attachments)
+        ]
+        if not already_in_messages:
+            history.append({
+                "role": "user",
+                "content": new_msg,
+                "attachments": new_attachments or [],
+            })
+        return history
+
+    def _get_effective_system(self, session: AgentSession) -> str | None:
+        base = session.system_prompt_ref.content if session.system_prompt_ref else None
+        summary_msg = next(
+            (m for m in reversed(session.messages) if m.role == "summary"), None
+        )
+        if summary_msg:
+            block = (
+                f"\n\n---\n以下是本次会话早期对话的摘要，请参考以保持上下文连贯：\n"
+                f"{summary_msg.content}"
+            )
+            return (base or "") + block
+        return base
+
+    @staticmethod
+    def _estimate_tokens(messages: list) -> int:
+        total = 0
+        for m in messages:
+            if m.role in ("user", "assistant") and m.content:
+                total += m.token_count if m.token_count else len(m.content) // 2
+        return total
+
+    async def _maybe_compress(self, session: AgentSession, config: LLMConfig) -> bool:
+        # Find the last summary boundary so we only measure/compress new content
+        last_summary_idx = -1
+        last_summary_content: str | None = None
+        for i, m in enumerate(session.messages):
+            if m.role == "summary":
+                last_summary_idx = i
+                last_summary_content = m.content
+
+        effective_msgs = [
+            m for m in session.messages[last_summary_idx + 1:]
             if m.role in ("user", "assistant") and m.content
         ]
-        history.append({"role": "user", "content": new_msg})
-        return history
+        if self._estimate_tokens(effective_msgs) <= settings.agent_compress_threshold:
+            return False
+
+        keep = settings.agent_compress_keep_recent
+        to_compress = effective_msgs[:-keep] if len(effective_msgs) > keep else []
+        if not to_compress:
+            return False
+
+        # Build cumulative compression input: prior summary + new messages to compress
+        parts: list[str] = []
+        if last_summary_content:
+            parts.append(f"[之前的对话摘要]:\n{last_summary_content}")
+        parts.append("\n".join(f"[{m.role}]: {m.content[:800]}" for m in to_compress))
+
+        adapter = make_adapter(config, [])
+        msgs = adapter.format_history([{
+            "role": "user",
+            "content": (
+                "请将以下对话内容（含历史摘要）压缩成一份简洁的累积摘要，"
+                "保留关键信息、重要决策和结论，用中文输出：\n\n"
+                + "\n\n".join(parts)
+            ),
+        }])
+        summary_text = ""
+        try:
+            async for item in adapter.stream(
+                msgs,
+                "你是对话摘要助手，请将对话内容压缩为简洁的累积摘要，保留关键信息。",
+                1000,
+            ):
+                if isinstance(item, str):
+                    summary_text += item
+        except Exception:
+            logger.warning("对话压缩失败，跳过本次压缩")
+            return False
+        if not summary_text.strip():
+            return False
+
+        await self._save_message(session.id, "summary", summary_text.strip())
+        logger.info(f"已压缩会话 {session.id} 的 {len(to_compress)} 条历史消息")
+        return True
 
     async def _save_message(
         self,
@@ -240,6 +376,7 @@ class AgentOrchestrator:
         content: str,
         tool_calls: dict | None = None,
         token_count: int | None = None,
+        attachments: list[dict] | None = None,
     ) -> Message:
         msg = Message(
             session_id=session_id,
@@ -247,6 +384,7 @@ class AgentOrchestrator:
             content=content,
             tool_calls=tool_calls,
             token_count=token_count,
+            attachments=attachments or None,
         )
         self.db.add(msg)
         await self.db.flush()

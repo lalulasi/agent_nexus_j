@@ -75,6 +75,10 @@ async def update_config(config_id: uuid.UUID, payload: LLMConfigUpdate, db: DB):
         config.api_key = payload.api_key
     if payload.base_url is not None:
         config.base_url = payload.base_url or None      # 空字符串清除
+    if payload.embedding_model is not None:
+        config.embedding_model = payload.embedding_model or None
+    if payload.embedding_dimensions is not None:
+        config.embedding_dimensions = payload.embedding_dimensions or None  # 0 清除
     await db.flush()
     await db.refresh(config)
     logger.info(f"已更新模型配置: {config.display_name}")

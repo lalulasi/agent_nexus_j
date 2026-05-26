@@ -10,8 +10,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from api.app.application.agent_orchestrator import AgentOrchestrator
 from api.app.application.collaboration_orchestrator import CollaborationOrchestrator
 from api.app.domain.schemas import ChatRequest, ChatResponse
-from api.app.infrastructure.database.models import AgentSession, LLMConfig
+from api.app.infrastructure.database.models import AgentSession, LLMConfig, Message
 from api.app.infrastructure.database.session import get_db
+from api.app.infrastructure.files.processor import process_attachment
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -62,11 +63,33 @@ async def chat_stream(payload: ChatRequest, db: DB):
     if not config:
         raise HTTPException(status_code=400, detail="尚未配置模型，请先在左侧面板保存模型配置。")
 
+    # 重试：先删除上一条 assistant 消息，并刷新 session.messages
+    if payload.is_retry:
+        del_result = await db.execute(
+            select(Message)
+            .where(Message.session_id == payload.session_id, Message.role == "assistant")
+            .order_by(Message.created_at.desc())
+            .limit(1)
+        )
+        last_asst = del_result.scalar_one_or_none()
+        if last_asst:
+            await db.delete(last_asst)
+            await db.flush()
+        await db.refresh(session, ["messages"])
+
+    processed_attachments = [
+        process_attachment(a.filename, a.mime_type, a.data)
+        for a in payload.attachments
+    ]
+
     orchestrator = AgentOrchestrator(db)
 
     async def event_stream():
         try:
-            async for chunk in orchestrator.stream_run(session, payload.message, config):
+            async for chunk in orchestrator.stream_run(
+                session, payload.message, config, processed_attachments,
+                is_retry=payload.is_retry,
+            ):
                 yield f"data: {chunk}\n\n"
         except Exception as e:
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"

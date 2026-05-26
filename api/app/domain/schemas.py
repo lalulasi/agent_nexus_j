@@ -11,6 +11,8 @@ class LLMConfigCreate(BaseModel):
     model: str = Field(..., min_length=1, max_length=100)
     api_key: str = Field(..., min_length=1)
     base_url: str | None = None
+    embedding_model: str | None = None
+    embedding_dimensions: int | None = None
 
 
 class LLMConfigUpdate(BaseModel):
@@ -18,6 +20,8 @@ class LLMConfigUpdate(BaseModel):
     model: str | None = None
     api_key: str | None = None   # None 表示不修改；空字符串无效
     base_url: str | None = None  # 空字符串清除
+    embedding_model: str | None = None
+    embedding_dimensions: int | None = None
 
 
 class LLMConfigOut(BaseModel):
@@ -27,6 +31,8 @@ class LLMConfigOut(BaseModel):
     api_key_masked: str
     base_url: str | None
     is_active: bool
+    embedding_model: str | None
+    embedding_dimensions: int | None
     created_at: datetime
     updated_at: datetime
 
@@ -43,6 +49,8 @@ class LLMConfigOut(BaseModel):
             api_key_masked=masked,
             base_url=obj.base_url,
             is_active=obj.is_active,
+            embedding_model=obj.embedding_model,
+            embedding_dimensions=obj.embedding_dimensions,
             created_at=obj.created_at,
             updated_at=obj.updated_at,
         )
@@ -87,6 +95,7 @@ class MessageOut(MessageBase):
     id: uuid.UUID
     session_id: uuid.UUID
     token_count: int | None = None
+    attachments: list | None = None
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -100,6 +109,7 @@ class SessionCreate(BaseModel):
     meta: dict | None = None
     collab_mode: str | None = None
     collab_config: dict | None = None
+    rag_enabled: bool = False
 
 
 class SessionUpdate(BaseModel):
@@ -127,6 +137,7 @@ class SessionOut(BaseModel):
     meta: dict | None
     collab_mode: str | None = None
     collab_config: dict | None = None
+    rag_enabled: bool = False
     created_at: datetime
     updated_at: datetime
     messages: list[MessageOut] = Field(default_factory=list)
@@ -195,13 +206,39 @@ class CollabConfigIn(BaseModel):
 
 # ── Chat ──────────────────────────────────────────────────────────────────────
 
+class AttachmentIn(BaseModel):
+    filename: str
+    mime_type: str
+    data: str  # base64 encoded bytes
+
+
 class ChatRequest(BaseModel):
     session_id: uuid.UUID
     message: str = Field(..., min_length=1)
     stream: bool = False
+    attachments: list[AttachmentIn] = Field(default_factory=list)
+    is_retry: bool = False
 
 
 class ChatResponse(BaseModel):
     session_id: uuid.UUID
     message: MessageOut
     usage: dict | None = None
+
+
+# ── Knowledge ─────────────────────────────────────────────────────────────────
+
+class KnowledgeDocumentOut(BaseModel):
+    id: uuid.UUID
+    filename: str
+    mime_type: str
+    chunk_count: int
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class KnowledgeQueryResult(BaseModel):
+    filename: str
+    content: str
+    score: float

@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.app.api.routers import chat, llm_configs, sessions, system_prompts, tools
+from api.app.api.routers import chat, knowledge, llm_configs, sessions, system_prompts, tools
 from api.app.core.config import get_settings
 from api.app.core.logger import logger, setup_logger
 from api.app.infrastructure.database.session import AsyncSessionLocal, init_db
@@ -45,6 +45,8 @@ async def lifespan(app: FastAPI):
     logger.info(f"Starting AgentNexus-J [{settings.app_env.value}]")
     await init_db()
     await _seed_builtin_tools()
+    from api.app.infrastructure.embedding.local_service import preload_default_model
+    await preload_default_model()
     yield
     logger.info("Shutting down AgentNexus-J")
 
@@ -71,6 +73,7 @@ app.include_router(system_prompts.router, prefix="/api/v1")
 app.include_router(tools.router, prefix="/api/v1")
 app.include_router(sessions.router, prefix="/api/v1")
 app.include_router(chat.router, prefix="/api/v1")
+app.include_router(knowledge.router, prefix="/api/v1")
 
 
 @app.get("/health")

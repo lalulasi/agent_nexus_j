@@ -34,6 +34,7 @@ async def create_session(payload: SessionCreate, db: DB):
         meta=payload.meta,
         collab_mode=payload.collab_mode,
         collab_config=payload.collab_config,
+        rag_enabled=payload.rag_enabled,
     )
     db.add(session)
     await db.flush()
