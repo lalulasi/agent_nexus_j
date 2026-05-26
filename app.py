@@ -428,562 +428,546 @@ def _emb_label(model_id: str | None) -> str:
 with st.sidebar:
     st.title("💠 AgentNexus-J")
     st.caption("企业级多智能体协作控制台")
-    st.divider()
-
-    # ── 模型配置区 ────────────────────────────────────────────────────────────
-    st.subheader("🔧 外接大模型配置")
 
     configs: list[dict] = api("GET", "/llm-configs/", silent=True) or []
     active_config = next((c for c in configs if c["is_active"]), None)
 
-    # 接入新模型（始终显示在顶部）
-    with st.expander("＋ 接入新模型", expanded=not bool(configs)):
-        with st.form("llm_config_form", clear_on_submit=True):
-            n_name = st.text_input("配置名称 *", placeholder="例：DeepSeek 生产")
-            n_model = st.text_input("模型名称 *", placeholder="例：deepseek-chat")
-            n_key = st.text_input("API Key *", type="password", placeholder="sk-...")
-            n_url = st.text_input("API URL（可选）", placeholder="留空使用 Anthropic 官方地址")
-            n_emb_label = st.selectbox(
-                "嵌入模型（用于 RAG 知识库）",
-                options=_EMB_LABELS,
-                index=0,
-                help="首次选择非默认模型时，后端会从 HuggingFace 下载 ONNX 文件并缓存本地，之后离线可用。",
-            )
-            n_emb_model = _EMB_OPTIONS[n_emb_label]
-            submitted = st.form_submit_button("💾 保存并激活", use_container_width=True, type="primary")
-        if submitted:
-            if not n_name or not n_model or not n_key:
-                st.error("配置名称、模型名称、API Key 为必填项。")
-            else:
-                result = api("POST", "/llm-configs/", json={
-                    "display_name": n_name, "model": n_model,
-                    "api_key": n_key, "base_url": n_url or None,
-                    "embedding_model": n_emb_model,
-                })
-                if result:
-                    st.success(f"✅ 已接入并激活：{result['display_name']}")
-                    st.rerun()
+    tab_chat, tab_model, tab_tools, tab_kb = st.tabs(["💬 会话", "⚙️ 模型", "🛠 工具", "📚 知识库"])
 
-    if configs:
-        options_map = {
-            f"{'✅ ' if c['is_active'] else '　 '}{c['display_name']}  ·  {c['model']}": c
-            for c in configs
-        }
-        default_idx = next((i for i, c in enumerate(configs) if c["is_active"]), 0)
-        selected_label = st.selectbox(
-            "选择模型配置",
-            options=list(options_map.keys()),
-            index=default_idx,
-            label_visibility="collapsed",
-        )
-        selected = options_map[selected_label]
+    # ── Tab: 模型 + System Prompt ────────────────────────────────────────────
+    with tab_model:
+        st.subheader("🔧 模型配置")
 
-        col_act, col_edit = st.columns(2)
-        if not selected["is_active"]:
-            if col_act.button("⚡ 激活", use_container_width=True, type="primary"):
-                api("POST", f"/llm-configs/{selected['id']}/activate")
-                st.rerun()
-        else:
-            col_act.success("已激活 ✅")
-
-        if col_edit.button("✏️ 编辑", use_container_width=True):
-            st.session_state.editing_config_id = (
-                None if st.session_state.editing_config_id == selected["id"]
-                else selected["id"]
-            )
-            st.rerun()
-
-        # 编辑表单（行内展开）
-        if st.session_state.editing_config_id == selected["id"]:
-            with st.form(f"edit_config_{selected['id']}"):
-                st.caption(f"编辑：{selected['display_name']}")
-                e_name = st.text_input("配置名称", value=selected["display_name"])
-                e_model = st.text_input("模型名称", value=selected["model"])
-                e_key = st.text_input("API Key（留空保持不变）", type="password", placeholder="留空则不修改")
-                e_url = st.text_input(
-                    "API URL（留空清除）",
-                    value=selected.get("base_url") or "",
-                    placeholder="留空则使用官方地址",
-                )
-                _cur_emb_label = _emb_label(selected.get("embedding_model"))
-                e_emb_label = st.selectbox(
-                    "嵌入模型",
+        with st.expander("＋ 接入新模型", expanded=not bool(configs)):
+            with st.form("llm_config_form", clear_on_submit=True):
+                n_name = st.text_input("配置名称 *", placeholder="例：DeepSeek 生产")
+                n_model = st.text_input("模型名称 *", placeholder="例：deepseek-chat")
+                n_key = st.text_input("API Key *", type="password", placeholder="sk-...")
+                n_url = st.text_input("API URL（可选）", placeholder="留空使用 Anthropic 官方地址")
+                n_emb_label = st.selectbox(
+                    "嵌入模型（用于 RAG 知识库）",
                     options=_EMB_LABELS,
-                    index=_EMB_LABELS.index(_cur_emb_label),
-                    help="首次选择非默认模型时，后端从 HuggingFace 下载 ONNX 文件并缓存本地。",
+                    index=0,
+                    help="首次选择非默认模型时，后端会从 HuggingFace 下载 ONNX 文件并缓存本地，之后离线可用。",
                 )
-                e_emb_model = _EMB_OPTIONS[e_emb_label]
-                s_col, c_col = st.columns(2)
-                save = s_col.form_submit_button("💾 保存", use_container_width=True, type="primary")
-                cancel = c_col.form_submit_button("取消", use_container_width=True)
-
-            if save:
-                payload: dict = {}
-                if e_name.strip():
-                    payload["display_name"] = e_name
-                if e_model.strip():
-                    payload["model"] = e_model
-                if e_key.strip():
-                    payload["api_key"] = e_key
-                payload["base_url"] = e_url.strip() or ""
-                # 发送空字符串让后端清除；发送 None 后端会当"不修改"跳过
-                payload["embedding_model"] = e_emb_model or ""  # "" 触发后端清除为 NULL
-                result = api("PATCH", f"/llm-configs/{selected['id']}", json=payload)
-                if result:
-                    st.session_state.editing_config_id = None
-                    st.rerun()
-            if cancel:
-                st.session_state.editing_config_id = None
-                st.rerun()
-
-        _cap_parts = [f"Key: `{selected['api_key_masked']}`"]
-        if selected.get("base_url"):
-            _cap_parts.append(f"`{selected['base_url']}`")
-        if selected.get("embedding_model"):
-            _cap_parts.append(f"Emb: `{selected['embedding_model']}`")
-        st.caption("  ·  ".join(_cap_parts))
-
-    # ── System Prompt 库 ──────────────────────────────────────────────────────
-    st.divider()
-    st.subheader("📋 System Prompt 库")
-
-    sp_list: list[dict] = api("GET", "/system-prompts/", silent=True) or []
-
-    # 新建提示词
-    with st.expander("＋ 新建提示词"):
-        with st.form("new_sp_form", clear_on_submit=True):
-            sp_new_name = st.text_input("名称 *", placeholder="例：客服助手")
-            sp_new_content = st.text_area("内容 *", height=100,
-                                          placeholder="在此输入 System Prompt 内容...")
-            if st.form_submit_button("💾 保存", use_container_width=True, type="primary"):
-                if sp_new_name.strip() and sp_new_content.strip():
-                    r = api("POST", "/system-prompts/",
-                            json={"name": sp_new_name.strip(), "content": sp_new_content.strip()})
-                    if r:
-                        st.session_state.selected_sp_id = r["id"]
-                        st.rerun()
+                n_emb_model = _EMB_OPTIONS[n_emb_label]
+                submitted = st.form_submit_button("💾 保存并激活", use_container_width=True, type="primary")
+            if submitted:
+                if not n_name or not n_model or not n_key:
+                    st.error("配置名称、模型名称、API Key 为必填项。")
                 else:
-                    st.warning("名称和内容均为必填。")
-
-    if sp_list:
-        sp_options = {"（不使用）": None} | {sp["name"]: sp["id"] for sp in sp_list}
-        current_sp_name = next(
-            (sp["name"] for sp in sp_list if sp["id"] == st.session_state.selected_sp_id),
-            "（不使用）",
-        )
-        selected_sp_name = st.selectbox(
-            "选择提示词",
-            options=list(sp_options.keys()),
-            index=list(sp_options.keys()).index(current_sp_name),
-            label_visibility="collapsed",
-        )
-        st.session_state.selected_sp_id = sp_options[selected_sp_name]
-
-        selected_sp = next((sp for sp in sp_list if sp["id"] == st.session_state.selected_sp_id), None)
-
-        if selected_sp:
-            # 预览内容
-            st.caption(selected_sp["content"][:120] + ("…" if len(selected_sp["content"]) > 120 else ""))
-
-            # 编辑 / 删除
-            col_sp_edit, col_sp_del = st.columns(2)
-            if col_sp_edit.button("✏️ 编辑", key="sp_edit_btn", use_container_width=True):
-                st.session_state.editing_sp_id = (
-                    None if st.session_state.editing_sp_id == selected_sp["id"]
-                    else selected_sp["id"]
-                )
-                st.rerun()
-            if col_sp_del.button("🗑 删除", key="sp_del_btn", use_container_width=True):
-                api("DELETE", f"/system-prompts/{selected_sp['id']}")
-                st.session_state.selected_sp_id = None
-                st.session_state.editing_sp_id = None
-                st.rerun()
-
-            if st.session_state.editing_sp_id == selected_sp["id"]:
-                with st.form(f"edit_sp_{selected_sp['id']}"):
-                    e_sp_name = st.text_input("名称", value=selected_sp["name"])
-                    e_sp_content = st.text_area("内容", value=selected_sp["content"], height=100)
-                    ec1, ec2 = st.columns(2)
-                    if ec1.form_submit_button("💾 保存", use_container_width=True, type="primary"):
-                        patch: dict = {}
-                        if e_sp_name.strip():
-                            patch["name"] = e_sp_name.strip()
-                        if e_sp_content.strip():
-                            patch["content"] = e_sp_content.strip()
-                        if patch:
-                            api("PATCH", f"/system-prompts/{selected_sp['id']}", json=patch)
-                        st.session_state.editing_sp_id = None
-                        st.rerun()
-                    if ec2.form_submit_button("取消", use_container_width=True):
-                        st.session_state.editing_sp_id = None
-                        st.rerun()
-
-        # 应用到当前会话
-        if st.session_state.active_session_id:
-            if st.button("✅ 应用到当前会话", use_container_width=True, type="primary"):
-                sp_id = st.session_state.selected_sp_id
-                if sp_id:
-                    api("PATCH", f"/sessions/{st.session_state.active_session_id}",
-                        json={"system_prompt_id": sp_id})
-                else:
-                    api("PATCH", f"/sessions/{st.session_state.active_session_id}",
-                        json={"clear_system_prompt": True})
-                st.rerun()
-    else:
-        st.caption("暂无提示词，点击上方新建。")
-
-    # ── 工具管理区 ────────────────────────────────────────────────────────────
-    st.divider()
-    st.subheader("🛠 工具管理")
-
-    all_tools: list[dict] = api("GET", "/tools/", silent=True) or []
-
-    # 接入新 HTTP 工具
-    with st.expander("＋ 接入新工具"):
-        with st.form("new_tool_form", clear_on_submit=True):
-            t_name = st.text_input("工具标识符 *", placeholder="snake_case，如 search_web")
-            t_display = st.text_input("显示名称 *", placeholder="如 Web 搜索")
-            t_desc = st.text_area("功能描述 *", height=70,
-                                  placeholder="向大模型说明这个工具的用途和触发条件")
-            t_url = st.text_input("接口地址 *", placeholder="https://your-api.com/endpoint")
-            t_method = st.selectbox("请求方式", ["POST", "GET"])
-            t_headers = st.text_area("请求头（JSON，可选）", height=50,
-                                     placeholder='{"Authorization": "Bearer token"}')
-            t_schema = st.text_area(
-                "参数定义（JSON Schema）",
-                height=100,
-                value='{\n  "type": "object",\n  "properties": {\n    "query": {"type": "string", "description": "查询内容"}\n  },\n  "required": ["query"]\n}',
-            )
-            if st.form_submit_button("💾 保存工具", use_container_width=True, type="primary"):
-                errors = []
-                if not t_name.strip():
-                    errors.append("工具标识符不能为空")
-                if not t_display.strip():
-                    errors.append("显示名称不能为空")
-                if not t_desc.strip():
-                    errors.append("功能描述不能为空")
-                if not t_url.strip():
-                    errors.append("接口地址不能为空")
-                headers_dict = None
-                if t_headers.strip():
-                    try:
-                        headers_dict = json.loads(t_headers)
-                    except json.JSONDecodeError:
-                        errors.append("请求头 JSON 格式错误")
-                schema_dict = {"type": "object", "properties": {}}
-                if t_schema.strip():
-                    try:
-                        schema_dict = json.loads(t_schema)
-                    except json.JSONDecodeError:
-                        errors.append("参数定义 JSON 格式错误")
-                if errors:
-                    for e in errors:
-                        st.error(e)
-                else:
-                    r = api("POST", "/tools/", json={
-                        "name": t_name.strip(),
-                        "display_name": t_display.strip(),
-                        "description": t_desc.strip(),
-                        "http_url": t_url.strip(),
-                        "http_method": t_method,
-                        "http_headers": headers_dict,
-                        "parameters_schema": schema_dict,
+                    result = api("POST", "/llm-configs/", json={
+                        "display_name": n_name, "model": n_model,
+                        "api_key": n_key, "base_url": n_url or None,
+                        "embedding_model": n_emb_model,
                     })
-                    if r:
-                        st.success(f"✅ 工具 '{t_display.strip()}' 已接入")
+                    if result:
+                        st.success(f"✅ 已接入并激活：{result['display_name']}")
                         st.rerun()
 
-    # 工具列表
-    if all_tools:
-        for t in all_tools:
-            is_builtin = t["tool_type"] == "builtin"
-            badge = "🔵 内置" if is_builtin else "🟠 HTTP"
-            col_badge, col_name, col_toggle, *col_rest = st.columns(
-                [1.2, 4, 1.2] + ([1, 1] if not is_builtin else [])
-            )
-            col_badge.caption(badge)
-            col_name.markdown(f"**{t['display_name']}**  \n`{t['name']}`")
-            # 开关
-            active = col_toggle.toggle(
-                "启用",
-                value=t["is_active"],
-                key=f"tool_toggle_{t['id']}",
+        if configs:
+            options_map = {
+                f"{'✅ ' if c['is_active'] else '　 '}{c['display_name']}  ·  {c['model']}": c
+                for c in configs
+            }
+            default_idx = next((i for i, c in enumerate(configs) if c["is_active"]), 0)
+            selected_label = st.selectbox(
+                "选择模型配置",
+                options=list(options_map.keys()),
+                index=default_idx,
                 label_visibility="collapsed",
             )
-            if active != t["is_active"]:
-                api("PATCH", f"/tools/{t['id']}/toggle")
-                st.rerun()
-            # HTTP 工具：编辑 + 删除
-            if not is_builtin and col_rest:
-                col_edit, col_del = col_rest
-                if col_edit.button("✏️", key=f"te_{t['id']}", help="编辑"):
-                    st.session_state.editing_tool_id = (
-                        None if st.session_state.get("editing_tool_id") == t["id"] else t["id"]
-                    )
+            selected = options_map[selected_label]
+
+            col_act, col_edit = st.columns(2)
+            if not selected["is_active"]:
+                if col_act.button("⚡ 激活", use_container_width=True, type="primary"):
+                    api("POST", f"/llm-configs/{selected['id']}/activate")
                     st.rerun()
-                if col_del.button("🗑", key=f"td_{t['id']}", help="删除"):
-                    api("DELETE", f"/tools/{t['id']}")
-                    st.rerun()
-            # 编辑表单（行内展开）
-            if st.session_state.get("editing_tool_id") == t["id"]:
-                with st.form(f"edit_tool_{t['id']}"):
-                    et_display = st.text_input("显示名称", value=t["display_name"])
-                    et_desc = st.text_area("描述", value=t["description"], height=70)
-                    et_url = st.text_input("接口地址", value=t.get("http_url") or "")
-                    et_method = st.selectbox("请求方式", ["POST", "GET"],
-                                             index=0 if t.get("http_method", "POST") == "POST" else 1)
-                    et_schema = st.text_area(
-                        "参数定义（JSON Schema）",
-                        value=json.dumps(t.get("parameters_schema") or {}, ensure_ascii=False, indent=2),
-                        height=80,
-                    )
-                    ec1, ec2 = st.columns(2)
-                    if ec1.form_submit_button("💾 保存", use_container_width=True, type="primary"):
-                        patch: dict = {
-                            "display_name": et_display.strip() or None,
-                            "description": et_desc.strip() or None,
-                            "http_url": et_url.strip() or None,
-                            "http_method": et_method,
-                        }
-                        try:
-                            patch["parameters_schema"] = json.loads(et_schema)
-                        except json.JSONDecodeError:
-                            st.error("参数定义 JSON 格式错误")
-                            st.stop()
-                        patch = {k: v for k, v in patch.items() if v is not None}
-                        api("PATCH", f"/tools/{t['id']}", json=patch)
-                        st.session_state.editing_tool_id = None
-                        st.rerun()
-                    if ec2.form_submit_button("取消", use_container_width=True):
-                        st.session_state.editing_tool_id = None
-                        st.rerun()
-    else:
-        st.caption("暂无工具，重启后端后内置工具将自动同步。")
-
-    # ── 知识库管理 ────────────────────────────────────────────────────────────
-    st.divider()
-    st.subheader("📚 知识库")
-
-    _ext_emb = active_config.get("embedding_model") if active_config else None
-    if _ext_emb:
-        st.caption(f"🔌 外部嵌入：`{_ext_emb}`")
-    else:
-        st.caption("🏠 内置本地模型：`bge-small-zh-v1.5`（中文优化，512 维，无需 API）")
-
-    with st.expander("＋ 上传文档"):
-        _kb_file = st.file_uploader(
-            "选择文件",
-            key="kb_file_upload",
-            type=["pdf", "docx", "doc", "xlsx", "xls", "txt", "md", "csv", "py", "js", "ts", "json"],
-            label_visibility="collapsed",
-        )
-        if _kb_file:
-            if st.button("📤 上传到知识库", use_container_width=True, type="primary", key="kb_upload_btn"):
-                with st.spinner("正在处理并嵌入文档，请稍候..."):
-                    _kb_file.seek(0)
-                    _kb_result = api(
-                        "POST", "/knowledge/upload",
-                        files={"file": (_kb_file.name, _kb_file.read(), _kb_file.type or "application/octet-stream")},
-                    )
-                if _kb_result:
-                    st.success(f"✅ {_kb_result['filename']}（{_kb_result['chunk_count']} 块）")
-                    st.rerun()
-
-    _kb_docs: list[dict] = api("GET", "/knowledge/", silent=True) or []
-    if _kb_docs:
-        for _doc in _kb_docs:
-            _dc1, _dc2, _dc3 = st.columns([5, 1.5, 1])
-            _dc1.markdown(f"📄 **{_doc['filename']}**")
-            _dc2.caption(f"{_doc['chunk_count']} 块")
-            if _dc3.button("🗑", key=f"kb_del_{_doc['id']}", help="删除"):
-                api("DELETE", f"/knowledge/{_doc['id']}")
-                st.rerun()
-    else:
-        st.caption("知识库为空，上传文档后可在会话中启用 RAG。")
-
-    # ── 会话列表区 ────────────────────────────────────────────────────────────
-    st.divider()
-    st.subheader("💬 会话列表")
-
-    # 普通新建
-    col_new, col_collab = st.columns(2)
-    _rag_new_toggle = st.checkbox(
-        "🔍 启用 RAG",
-        key="rag_new_session",
-        value=False,
-        help="新会话开启知识库检索（使用内置本地嵌入模型，无需额外配置）",
-    )
-    if col_new.button("＋ 普通会话", use_container_width=True, type="primary"):
-        if not active_config:
-            st.error("请先配置并激活一个模型。")
-        else:
-            sp_id = st.session_state.get("selected_sp_id")
-            result = api("POST", "/sessions/", json={
-                "title": "新会话",
-                "system_prompt_id": sp_id,
-                "rag_enabled": _rag_new_toggle,
-            })
-            if result:
-                st.session_state.active_session_id = result["id"]
-                st.session_state.active_session_collab_mode = None
-                st.session_state.chat_history = []
-                st.rerun()
-
-    if col_collab.button("⚡ 协作会话", use_container_width=True):
-        st.session_state.collab_show_form = not st.session_state.collab_show_form
-        st.rerun()
-
-    # 协作会话创建表单（折叠）
-    if st.session_state.collab_show_form:
-        with st.container(border=True):
-            st.caption("⚡ 新建多模型协作会话")
-            if len(configs) < 2:
-                st.warning("至少需要 2 个模型配置才能使用协作模式。")
             else:
-                collab_mode_sel = st.radio(
-                    "协作模式",
-                    ["🔀 圆桌模式（B+C 迭代辩论）", "👑 主从模式（主答 + 评委评分）"],
-                    horizontal=True,
+                col_act.success("已激活 ✅")
+
+            if col_edit.button("✏️ 编辑", use_container_width=True):
+                st.session_state.editing_config_id = (
+                    None if st.session_state.editing_config_id == selected["id"]
+                    else selected["id"]
+                )
+                st.rerun()
+
+            if st.session_state.editing_config_id == selected["id"]:
+                with st.form(f"edit_config_{selected['id']}"):
+                    st.caption(f"编辑：{selected['display_name']}")
+                    e_name = st.text_input("配置名称", value=selected["display_name"])
+                    e_model = st.text_input("模型名称", value=selected["model"])
+                    e_key = st.text_input("API Key（留空保持不变）", type="password", placeholder="留空则不修改")
+                    e_url = st.text_input(
+                        "API URL（留空清除）",
+                        value=selected.get("base_url") or "",
+                        placeholder="留空则使用官方地址",
+                    )
+                    _cur_emb_label = _emb_label(selected.get("embedding_model"))
+                    e_emb_label = st.selectbox(
+                        "嵌入模型",
+                        options=_EMB_LABELS,
+                        index=_EMB_LABELS.index(_cur_emb_label),
+                        help="首次选择非默认模型时，后端从 HuggingFace 下载 ONNX 文件并缓存本地。",
+                    )
+                    e_emb_model = _EMB_OPTIONS[e_emb_label]
+                    s_col, c_col = st.columns(2)
+                    save = s_col.form_submit_button("💾 保存", use_container_width=True, type="primary")
+                    cancel = c_col.form_submit_button("取消", use_container_width=True)
+
+                if save:
+                    payload: dict = {}
+                    if e_name.strip():
+                        payload["display_name"] = e_name
+                    if e_model.strip():
+                        payload["model"] = e_model
+                    if e_key.strip():
+                        payload["api_key"] = e_key
+                    payload["base_url"] = e_url.strip() or ""
+                    payload["embedding_model"] = e_emb_model or ""
+                    result = api("PATCH", f"/llm-configs/{selected['id']}", json=payload)
+                    if result:
+                        st.session_state.editing_config_id = None
+                        st.rerun()
+                if cancel:
+                    st.session_state.editing_config_id = None
+                    st.rerun()
+
+            _cap_parts = [f"Key: `{selected['api_key_masked']}`"]
+            if selected.get("base_url"):
+                _cap_parts.append(f"`{selected['base_url']}`")
+            if selected.get("embedding_model"):
+                _cap_parts.append(f"Emb: `{selected['embedding_model']}`")
+            st.caption("  ·  ".join(_cap_parts))
+
+        st.divider()
+        st.subheader("📋 System Prompt 库")
+
+        sp_list: list[dict] = api("GET", "/system-prompts/", silent=True) or []
+
+        with st.expander("＋ 新建提示词"):
+            with st.form("new_sp_form", clear_on_submit=True):
+                sp_new_name = st.text_input("名称 *", placeholder="例：客服助手")
+                sp_new_content = st.text_area("内容 *", height=100,
+                                              placeholder="在此输入 System Prompt 内容...")
+                if st.form_submit_button("💾 保存", use_container_width=True, type="primary"):
+                    if sp_new_name.strip() and sp_new_content.strip():
+                        r = api("POST", "/system-prompts/",
+                                json={"name": sp_new_name.strip(), "content": sp_new_content.strip()})
+                        if r:
+                            st.session_state.selected_sp_id = r["id"]
+                            st.rerun()
+                    else:
+                        st.warning("名称和内容均为必填。")
+
+        if sp_list:
+            sp_options = {"（不使用）": None} | {sp["name"]: sp["id"] for sp in sp_list}
+            current_sp_name = next(
+                (sp["name"] for sp in sp_list if sp["id"] == st.session_state.selected_sp_id),
+                "（不使用）",
+            )
+            selected_sp_name = st.selectbox(
+                "选择提示词",
+                options=list(sp_options.keys()),
+                index=list(sp_options.keys()).index(current_sp_name),
+                label_visibility="collapsed",
+            )
+            st.session_state.selected_sp_id = sp_options[selected_sp_name]
+
+            selected_sp = next((sp for sp in sp_list if sp["id"] == st.session_state.selected_sp_id), None)
+
+            if selected_sp:
+                st.caption(selected_sp["content"][:120] + ("…" if len(selected_sp["content"]) > 120 else ""))
+
+                col_sp_edit, col_sp_del = st.columns(2)
+                if col_sp_edit.button("✏️ 编辑", key="sp_edit_btn", use_container_width=True):
+                    st.session_state.editing_sp_id = (
+                        None if st.session_state.editing_sp_id == selected_sp["id"]
+                        else selected_sp["id"]
+                    )
+                    st.rerun()
+                if col_sp_del.button("🗑 删除", key="sp_del_btn", use_container_width=True):
+                    api("DELETE", f"/system-prompts/{selected_sp['id']}")
+                    st.session_state.selected_sp_id = None
+                    st.session_state.editing_sp_id = None
+                    st.rerun()
+
+                if st.session_state.editing_sp_id == selected_sp["id"]:
+                    with st.form(f"edit_sp_{selected_sp['id']}"):
+                        e_sp_name = st.text_input("名称", value=selected_sp["name"])
+                        e_sp_content = st.text_area("内容", value=selected_sp["content"], height=100)
+                        ec1, ec2 = st.columns(2)
+                        if ec1.form_submit_button("💾 保存", use_container_width=True, type="primary"):
+                            patch: dict = {}
+                            if e_sp_name.strip():
+                                patch["name"] = e_sp_name.strip()
+                            if e_sp_content.strip():
+                                patch["content"] = e_sp_content.strip()
+                            if patch:
+                                api("PATCH", f"/system-prompts/{selected_sp['id']}", json=patch)
+                            st.session_state.editing_sp_id = None
+                            st.rerun()
+                        if ec2.form_submit_button("取消", use_container_width=True):
+                            st.session_state.editing_sp_id = None
+                            st.rerun()
+
+            if st.session_state.active_session_id:
+                if st.button("✅ 应用到当前会话", use_container_width=True, type="primary"):
+                    sp_id = st.session_state.selected_sp_id
+                    if sp_id:
+                        api("PATCH", f"/sessions/{st.session_state.active_session_id}",
+                            json={"system_prompt_id": sp_id})
+                    else:
+                        api("PATCH", f"/sessions/{st.session_state.active_session_id}",
+                            json={"clear_system_prompt": True})
+                    st.rerun()
+        else:
+            st.caption("暂无提示词，点击上方新建。")
+
+    # ── Tab: 工具管理 ────────────────────────────────────────────────────────
+    with tab_tools:
+        st.subheader("🛠 工具管理")
+
+        all_tools: list[dict] = api("GET", "/tools/", silent=True) or []
+
+        with st.expander("＋ 接入新工具"):
+            with st.form("new_tool_form", clear_on_submit=True):
+                t_name = st.text_input("工具标识符 *", placeholder="snake_case，如 search_web")
+                t_display = st.text_input("显示名称 *", placeholder="如 Web 搜索")
+                t_desc = st.text_area("功能描述 *", height=70,
+                                      placeholder="向大模型说明这个工具的用途和触发条件")
+                t_url = st.text_input("接口地址 *", placeholder="https://your-api.com/endpoint")
+                t_method = st.selectbox("请求方式", ["POST", "GET"])
+                t_headers = st.text_area("请求头（JSON，可选）", height=50,
+                                         placeholder='{"Authorization": "Bearer token"}')
+                t_schema = st.text_area(
+                    "参数定义（JSON Schema）",
+                    height=100,
+                    value='{\n  "type": "object",\n  "properties": {\n    "query": {"type": "string", "description": "查询内容"}\n  },\n  "required": ["query"]\n}',
+                )
+                if st.form_submit_button("💾 保存工具", use_container_width=True, type="primary"):
+                    errors = []
+                    if not t_name.strip():
+                        errors.append("工具标识符不能为空")
+                    if not t_display.strip():
+                        errors.append("显示名称不能为空")
+                    if not t_desc.strip():
+                        errors.append("功能描述不能为空")
+                    if not t_url.strip():
+                        errors.append("接口地址不能为空")
+                    headers_dict = None
+                    if t_headers.strip():
+                        try:
+                            headers_dict = json.loads(t_headers)
+                        except json.JSONDecodeError:
+                            errors.append("请求头 JSON 格式错误")
+                    schema_dict = {"type": "object", "properties": {}}
+                    if t_schema.strip():
+                        try:
+                            schema_dict = json.loads(t_schema)
+                        except json.JSONDecodeError:
+                            errors.append("参数定义 JSON 格式错误")
+                    if errors:
+                        for e in errors:
+                            st.error(e)
+                    else:
+                        r = api("POST", "/tools/", json={
+                            "name": t_name.strip(),
+                            "display_name": t_display.strip(),
+                            "description": t_desc.strip(),
+                            "http_url": t_url.strip(),
+                            "http_method": t_method,
+                            "http_headers": headers_dict,
+                            "parameters_schema": schema_dict,
+                        })
+                        if r:
+                            st.success(f"✅ 工具 '{t_display.strip()}' 已接入")
+                            st.rerun()
+
+        if all_tools:
+            for t in all_tools:
+                is_builtin = t["tool_type"] == "builtin"
+                badge = "🔵 内置" if is_builtin else "🟠 HTTP"
+                col_badge, col_name, col_toggle, *col_rest = st.columns(
+                    [1.2, 4, 1.2] + ([1, 1] if not is_builtin else [])
+                )
+                col_badge.caption(badge)
+                col_name.markdown(f"**{t['display_name']}**  \n`{t['name']}`")
+                active = col_toggle.toggle(
+                    "启用",
+                    value=t["is_active"],
+                    key=f"tool_toggle_{t['id']}",
                     label_visibility="collapsed",
                 )
-                is_round_table = "圆桌" in collab_mode_sel
-
-                config_options = {f"{c['display_name']} · {c['model']}": c["id"] for c in configs}
-                config_labels = list(config_options.keys())
-
-                _ROLES_RT = ["proposer（提案者）", "critic（批判者）",
-                              "creative（创意者）", "validator（验证者）", "synthesizer（综合者）"]
-                _ROLE_KEYS = ["proposer", "critic", "creative", "validator", "synthesizer"]
-
-                if is_round_table:
-                    n_models = st.slider("模型数量", min_value=2, max_value=min(5, len(configs)), value=min(3, len(configs)))
-                    rounds_rt = st.radio("讨论轮次", [1, 2], index=1,
-                                         format_func=lambda x: f"{x} 轮（{'仅独立作答' if x == 1 else '独立作答 + 交叉审视'}）",
-                                         horizontal=True)
-                    st.caption("最后一个槽位固定为综合者，其余按序自动分配角色。")
-                    rt_model_ids = []
-                    for i in range(n_models):
-                        auto_role = _ROLES_RT[min(i, len(_ROLES_RT) - 1)] if i < n_models - 1 else _ROLES_RT[-1]
-                        default_idx = min(i, len(config_labels) - 1)
-                        sel = st.selectbox(
-                            f"槽位 {i+1}：{auto_role}",
-                            config_labels,
-                            index=default_idx,
-                            key=f"rt_slot_{i}",
+                if active != t["is_active"]:
+                    api("PATCH", f"/tools/{t['id']}/toggle")
+                    st.rerun()
+                if not is_builtin and col_rest:
+                    col_edit, col_del = col_rest
+                    if col_edit.button("✏️", key=f"te_{t['id']}", help="编辑"):
+                        st.session_state.editing_tool_id = (
+                            None if st.session_state.get("editing_tool_id") == t["id"] else t["id"]
                         )
-                        rt_model_ids.append(config_options[sel])
-
-                    sp_id_c = st.session_state.get("selected_sp_id")
-                    if st.button("✅ 创建圆桌会话", use_container_width=True, type="primary"):
-                        roles = [_ROLE_KEYS[min(i, len(_ROLE_KEYS) - 1)] if i < n_models - 1
-                                 else "synthesizer" for i in range(n_models)]
-                        collab_cfg = {
-                            "mode": "round_table",
-                            "rounds": rounds_rt,
-                            "models": [{"config_id": str(cid), "role": r}
-                                       for cid, r in zip(rt_model_ids, roles)],
-                        }
-                        result = api("POST", "/sessions/", json={
-                            "title": "新会话",
-                            "system_prompt_id": sp_id_c,
-                            "collab_mode": "round_table",
-                            "collab_config": collab_cfg,
-                        })
-                        if result:
-                            st.session_state.active_session_id = result["id"]
-                            st.session_state.active_session_collab_mode = "round_table"
-                            st.session_state.chat_history = []
-                            st.session_state.collab_show_form = False
+                        st.rerun()
+                    if col_del.button("🗑", key=f"td_{t['id']}", help="删除"):
+                        api("DELETE", f"/tools/{t['id']}")
+                        st.rerun()
+                if st.session_state.get("editing_tool_id") == t["id"]:
+                    with st.form(f"edit_tool_{t['id']}"):
+                        et_display = st.text_input("显示名称", value=t["display_name"])
+                        et_desc = st.text_area("描述", value=t["description"], height=70)
+                        et_url = st.text_input("接口地址", value=t.get("http_url") or "")
+                        et_method = st.selectbox("请求方式", ["POST", "GET"],
+                                                 index=0 if t.get("http_method", "POST") == "POST" else 1)
+                        et_schema = st.text_area(
+                            "参数定义（JSON Schema）",
+                            value=json.dumps(t.get("parameters_schema") or {}, ensure_ascii=False, indent=2),
+                            height=80,
+                        )
+                        ec1, ec2 = st.columns(2)
+                        if ec1.form_submit_button("💾 保存", use_container_width=True, type="primary"):
+                            patch: dict = {
+                                "display_name": et_display.strip() or None,
+                                "description": et_desc.strip() or None,
+                                "http_url": et_url.strip() or None,
+                                "http_method": et_method,
+                            }
+                            try:
+                                patch["parameters_schema"] = json.loads(et_schema)
+                            except json.JSONDecodeError:
+                                st.error("参数定义 JSON 格式错误")
+                                st.stop()
+                            patch = {k: v for k, v in patch.items() if v is not None}
+                            api("PATCH", f"/tools/{t['id']}", json=patch)
+                            st.session_state.editing_tool_id = None
                             st.rerun()
-                else:
-                    st.caption("主模型负责作答，评委模型并行评审打分。")
-                    master_sel = st.selectbox("主模型", config_labels, key="ms_master")
-                    remaining = [l for l in config_labels if l != master_sel] or config_labels
-                    max_rev = min(4, len(remaining))
-                    n_rev = st.slider("评委数量", 1, max_rev, min(2, max_rev))
-                    reviewer_ids = []
-                    for i in range(n_rev):
-                        default_idx = min(i, len(remaining) - 1)
-                        sel = st.selectbox(f"评委 {i+1}", remaining, index=default_idx, key=f"ms_rev_{i}")
-                        reviewer_ids.append(config_options[sel])
-
-                    sp_id_c = st.session_state.get("selected_sp_id")
-                    if st.button("✅ 创建主从会话", use_container_width=True, type="primary"):
-                        collab_cfg = {
-                            "mode": "master_slave",
-                            "master_config_id": str(config_options[master_sel]),
-                            "reviewer_config_ids": [str(rid) for rid in reviewer_ids],
-                        }
-                        result = api("POST", "/sessions/", json={
-                            "title": "新会话",
-                            "system_prompt_id": sp_id_c,
-                            "collab_mode": "master_slave",
-                            "collab_config": collab_cfg,
-                        })
-                        if result:
-                            st.session_state.active_session_id = result["id"]
-                            st.session_state.active_session_collab_mode = "master_slave"
-                            st.session_state.chat_history = []
-                            st.session_state.collab_show_form = False
+                        if ec2.form_submit_button("取消", use_container_width=True):
+                            st.session_state.editing_tool_id = None
                             st.rerun()
+        else:
+            st.caption("暂无工具，重启后端后内置工具将自动同步。")
 
-    sessions: list[dict] = api("GET", "/sessions/", silent=True) or []
+    # ── Tab: 知识库 ──────────────────────────────────────────────────────────
+    with tab_kb:
+        st.subheader("📚 知识库")
 
-    # 重命名弹出框（在列表上方）
-    if st.session_state.renaming_session_id:
-        rid = st.session_state.renaming_session_id
-        target = next((s for s in sessions if s["id"] == rid), None)
-        if target:
-            with st.form("rename_form"):
-                new_title = st.text_input("新名称", value=target["title"])
-                rc1, rc2 = st.columns(2)
-                if rc1.form_submit_button("确认", use_container_width=True, type="primary"):
-                    if new_title.strip():
-                        api("PATCH", f"/sessions/{rid}", json={"title": new_title})
-                    st.session_state.renaming_session_id = None
+        _ext_emb = active_config.get("embedding_model") if active_config else None
+        if _ext_emb:
+            st.caption(f"🔌 外部嵌入：`{_ext_emb}`")
+        else:
+            st.caption("🏠 内置本地模型：`bge-small-zh-v1.5`（中文优化，512 维，无需 API）")
+
+        with st.expander("＋ 上传文档"):
+            _kb_file = st.file_uploader(
+                "选择文件",
+                key="kb_file_upload",
+                type=["pdf", "docx", "doc", "xlsx", "xls", "txt", "md", "csv", "py", "js", "ts", "json"],
+                label_visibility="collapsed",
+            )
+            if _kb_file:
+                if st.button("📤 上传到知识库", use_container_width=True, type="primary", key="kb_upload_btn"):
+                    with st.spinner("正在处理并嵌入文档，请稍候..."):
+                        _kb_file.seek(0)
+                        _kb_result = api(
+                            "POST", "/knowledge/upload",
+                            files={"file": (_kb_file.name, _kb_file.read(), _kb_file.type or "application/octet-stream")},
+                        )
+                    if _kb_result:
+                        st.success(f"✅ {_kb_result['filename']}（{_kb_result['chunk_count']} 块）")
+                        st.rerun()
+
+        _kb_docs: list[dict] = api("GET", "/knowledge/", silent=True) or []
+        if _kb_docs:
+            for _doc in _kb_docs:
+                _dc1, _dc2, _dc3 = st.columns([5, 1.5, 1])
+                _dc1.markdown(f"📄 **{_doc['filename']}**")
+                _dc2.caption(f"{_doc['chunk_count']} 块")
+                if _dc3.button("🗑", key=f"kb_del_{_doc['id']}", help="删除"):
+                    api("DELETE", f"/knowledge/{_doc['id']}")
                     st.rerun()
-                if rc2.form_submit_button("取消", use_container_width=True):
-                    st.session_state.renaming_session_id = None
-                    st.rerun()
+        else:
+            st.caption("知识库为空，上传文档后可在会话中启用 RAG。")
 
-    for s in sessions:
-        is_current = s["id"] == st.session_state.active_session_id
-        collab_badge = "⚡ " if s.get("collab_mode") else ""
-        rag_badge = "🔍 " if s.get("rag_enabled") else ""
-        col_name, col_ren, col_del = st.columns([5, 1, 1])
-
-        with col_name:
-            label = ("▶ " if is_current else "") + collab_badge + rag_badge + s["title"]
-            if st.button(label, key=f"s_{s['id']}", use_container_width=True):
-                st.session_state.active_session_id = s["id"]
-                st.session_state.active_session_collab_mode = s.get("collab_mode")
-                st.session_state.selected_sp_id = s.get("system_prompt_id")
-                st.session_state.chat_history = [
-                    {
-                        "role": m["role"],
-                        "content": m["content"] or "",
-                        "attachments": m.get("attachments") or [],
-                    }
-                    for m in s.get("messages", [])
-                    if m["role"] in ("user", "assistant")
-                ]
-                st.rerun()
-
-        with col_ren:
-            if st.button("✏️", key=f"r_{s['id']}", help="重命名"):
-                st.session_state.renaming_session_id = (
-                    None if st.session_state.renaming_session_id == s["id"] else s["id"]
-                )
-                st.rerun()
-
-        with col_del:
-            if st.button("🗑", key=f"d_{s['id']}", help="删除"):
-                api("DELETE", f"/sessions/{s['id']}")
-                if s["id"] == st.session_state.active_session_id:
-                    st.session_state.active_session_id = None
+    # ── Tab: 会话 ────────────────────────────────────────────────────────────
+    with tab_chat:
+        col_new, col_collab = st.columns(2)
+        _rag_new_toggle = st.checkbox(
+            "🔍 启用 RAG",
+            key="rag_new_session",
+            value=False,
+            help="新会话开启知识库检索（使用内置本地嵌入模型，无需额外配置）",
+        )
+        if col_new.button("＋ 普通会话", use_container_width=True, type="primary"):
+            if not active_config:
+                st.error("请先配置并激活一个模型。")
+            else:
+                sp_id = st.session_state.get("selected_sp_id")
+                result = api("POST", "/sessions/", json={
+                    "title": "新会话",
+                    "system_prompt_id": sp_id,
+                    "rag_enabled": _rag_new_toggle,
+                })
+                if result:
+                    st.session_state.active_session_id = result["id"]
                     st.session_state.active_session_collab_mode = None
                     st.session_state.chat_history = []
-                st.rerun()
+                    st.rerun()
+
+        if col_collab.button("⚡ 协作会话", use_container_width=True):
+            st.session_state.collab_show_form = not st.session_state.collab_show_form
+            st.rerun()
+
+        if st.session_state.collab_show_form:
+            with st.container(border=True):
+                st.caption("⚡ 新建多模型协作会话")
+                if len(configs) < 2:
+                    st.warning("至少需要 2 个模型配置才能使用协作模式。")
+                else:
+                    collab_mode_sel = st.radio(
+                        "协作模式",
+                        ["🔀 圆桌模式（B+C 迭代辩论）", "👑 主从模式（主答 + 评委评分）"],
+                        horizontal=True,
+                        label_visibility="collapsed",
+                    )
+                    is_round_table = "圆桌" in collab_mode_sel
+
+                    config_options = {f"{c['display_name']} · {c['model']}": c["id"] for c in configs}
+                    config_labels = list(config_options.keys())
+
+                    _ROLES_RT = ["proposer（提案者）", "critic（批判者）",
+                                  "creative（创意者）", "validator（验证者）", "synthesizer（综合者）"]
+                    _ROLE_KEYS = ["proposer", "critic", "creative", "validator", "synthesizer"]
+
+                    if is_round_table:
+                        n_models = st.slider("模型数量", min_value=2, max_value=min(5, len(configs)), value=min(3, len(configs)))
+                        rounds_rt = st.radio("讨论轮次", [1, 2], index=1,
+                                             format_func=lambda x: f"{x} 轮（{'仅独立作答' if x == 1 else '独立作答 + 交叉审视'}）",
+                                             horizontal=True)
+                        st.caption("最后一个槽位固定为综合者，其余按序自动分配角色。")
+                        rt_model_ids = []
+                        for i in range(n_models):
+                            auto_role = _ROLES_RT[min(i, len(_ROLES_RT) - 1)] if i < n_models - 1 else _ROLES_RT[-1]
+                            default_idx = min(i, len(config_labels) - 1)
+                            sel = st.selectbox(
+                                f"槽位 {i+1}：{auto_role}",
+                                config_labels,
+                                index=default_idx,
+                                key=f"rt_slot_{i}",
+                            )
+                            rt_model_ids.append(config_options[sel])
+
+                        sp_id_c = st.session_state.get("selected_sp_id")
+                        if st.button("✅ 创建圆桌会话", use_container_width=True, type="primary"):
+                            roles = [_ROLE_KEYS[min(i, len(_ROLE_KEYS) - 1)] if i < n_models - 1
+                                     else "synthesizer" for i in range(n_models)]
+                            collab_cfg = {
+                                "mode": "round_table",
+                                "rounds": rounds_rt,
+                                "models": [{"config_id": str(cid), "role": r}
+                                           for cid, r in zip(rt_model_ids, roles)],
+                            }
+                            result = api("POST", "/sessions/", json={
+                                "title": "新会话",
+                                "system_prompt_id": sp_id_c,
+                                "collab_mode": "round_table",
+                                "collab_config": collab_cfg,
+                            })
+                            if result:
+                                st.session_state.active_session_id = result["id"]
+                                st.session_state.active_session_collab_mode = "round_table"
+                                st.session_state.chat_history = []
+                                st.session_state.collab_show_form = False
+                                st.rerun()
+                    else:
+                        st.caption("主模型负责作答，评委模型并行评审打分。")
+                        master_sel = st.selectbox("主模型", config_labels, key="ms_master")
+                        remaining = [l for l in config_labels if l != master_sel] or config_labels
+                        max_rev = min(4, len(remaining))
+                        n_rev = st.slider("评委数量", 1, max_rev, min(2, max_rev))
+                        reviewer_ids = []
+                        for i in range(n_rev):
+                            default_idx = min(i, len(remaining) - 1)
+                            sel = st.selectbox(f"评委 {i+1}", remaining, index=default_idx, key=f"ms_rev_{i}")
+                            reviewer_ids.append(config_options[sel])
+
+                        sp_id_c = st.session_state.get("selected_sp_id")
+                        if st.button("✅ 创建主从会话", use_container_width=True, type="primary"):
+                            collab_cfg = {
+                                "mode": "master_slave",
+                                "master_config_id": str(config_options[master_sel]),
+                                "reviewer_config_ids": [str(rid) for rid in reviewer_ids],
+                            }
+                            result = api("POST", "/sessions/", json={
+                                "title": "新会话",
+                                "system_prompt_id": sp_id_c,
+                                "collab_mode": "master_slave",
+                                "collab_config": collab_cfg,
+                            })
+                            if result:
+                                st.session_state.active_session_id = result["id"]
+                                st.session_state.active_session_collab_mode = "master_slave"
+                                st.session_state.chat_history = []
+                                st.session_state.collab_show_form = False
+                                st.rerun()
+
+        sessions: list[dict] = api("GET", "/sessions/", silent=True) or []
+
+        if st.session_state.renaming_session_id:
+            rid = st.session_state.renaming_session_id
+            target = next((s for s in sessions if s["id"] == rid), None)
+            if target:
+                with st.form("rename_form"):
+                    new_title = st.text_input("新名称", value=target["title"])
+                    rc1, rc2 = st.columns(2)
+                    if rc1.form_submit_button("确认", use_container_width=True, type="primary"):
+                        if new_title.strip():
+                            api("PATCH", f"/sessions/{rid}", json={"title": new_title})
+                        st.session_state.renaming_session_id = None
+                        st.rerun()
+                    if rc2.form_submit_button("取消", use_container_width=True):
+                        st.session_state.renaming_session_id = None
+                        st.rerun()
+
+        for s in sessions:
+            is_current = s["id"] == st.session_state.active_session_id
+            collab_badge = "⚡ " if s.get("collab_mode") else ""
+            rag_badge = "🔍 " if s.get("rag_enabled") else ""
+            col_name, col_ren, col_del = st.columns([5, 1, 1])
+
+            with col_name:
+                label = ("▶ " if is_current else "") + collab_badge + rag_badge + s["title"]
+                if st.button(label, key=f"s_{s['id']}", use_container_width=True):
+                    st.session_state.active_session_id = s["id"]
+                    st.session_state.active_session_collab_mode = s.get("collab_mode")
+                    st.session_state.selected_sp_id = s.get("system_prompt_id")
+                    st.session_state.chat_history = [
+                        {
+                            "role": m["role"],
+                            "content": m["content"] or "",
+                            "attachments": m.get("attachments") or [],
+                        }
+                        for m in s.get("messages", [])
+                        if m["role"] in ("user", "assistant")
+                    ]
+                    st.rerun()
+
+            with col_ren:
+                if st.button("✏️", key=f"r_{s['id']}", help="重命名"):
+                    st.session_state.renaming_session_id = (
+                        None if st.session_state.renaming_session_id == s["id"] else s["id"]
+                    )
+                    st.rerun()
+
+            with col_del:
+                if st.button("🗑", key=f"d_{s['id']}", help="删除"):
+                    api("DELETE", f"/sessions/{s['id']}")
+                    if s["id"] == st.session_state.active_session_id:
+                        st.session_state.active_session_id = None
+                        st.session_state.active_session_collab_mode = None
+                        st.session_state.chat_history = []
+                    st.rerun()
 
 # ── 主区域：对话界面 ───────────────────────────────────────────────────────────
 
