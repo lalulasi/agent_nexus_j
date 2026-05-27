@@ -2,7 +2,7 @@
 
 **企业级多智能体协作系统** — 基于 Jude 个人特色打造的 AI 助理枢纽。
 
-支持主流 LLM 接入、多模型协作辩论、RAG 知识库检索、多模态文件解析、工具调用，提供流式响应的 Web 控制台。
+支持主流 LLM 接入、多模型协作辩论、RAG 知识库检索、多模态文件解析、工具调用、MCP Agent 集成，提供流式响应的 Web 控制台。
 
 📘 **完整操作手册（安装 · 配置 · 功能说明 · 故障排查）→ [MANUAL.md](./MANUAL.md)**
 
@@ -12,15 +12,19 @@
 
 | 功能 | 说明 |
 |------|------|
-| **多 LLM 接入** | Anthropic Claude、DeepSeek、通义 Qwen、任意 OpenAI 兼容接口，随时切换 |
+| **多 LLM 接入** | Anthropic Claude、DeepSeek、通义 Qwen、任意 OpenAI 兼容接口，会话栏随时切换 |
+| **深度思考** | 每次对话可独立开启深度思考，支持 DeepSeek-R1 / QwQ / Claude 扩展思考，思考过程实时展示 |
 | **多模型协作** | 圆桌模式（多模型迭代辩论 + 综合者汇总）/ 主从模式（主模型作答 + 评委打分改进） |
+| **MCP Agent** | 接入外部 MCP Server（工具提供者 / Chat Agent / 两者兼备），工具自动注入 LLM 上下文，Agent 可作为协作槽位 |
 | **RAG 知识库** | 上传 PDF/DOCX/XLSX/TXT 文档，内置本地 ONNX 嵌入模型，对话自动检索相关内容 |
 | **多模态附件** | 上传图片（需视觉模型）、PDF、Office、代码文件，自动提取文本随消息发送 |
+| **网络搜索** | 每次对话可独立开启，支持 DuckDuckGo（免费无 Key）/ Tavily / Serper.dev，结果实时注入上下文 |
 | **工具调用** | 内置终端执行、系统时间；支持自定义 HTTP 工具，LLM 自动选择调用 |
 | **System Prompt 库** | 可复用提示词库，按需分配给会话 |
 | **长对话压缩** | Token 超限时自动摘要历史，无感保持上下文连贯 |
 | **流式输出** | 实时逐字输出，工具调用结果内联显示 |
 | **重试 / 复制** | 一键重新生成回答，一键复制到剪贴板 |
+| **对外请求日志** | 独立 `logs/outbound_*.log`，记录所有 LLM / MCP / HTTP 工具的请求参数与响应摘要 |
 | **自动主题** | 白天浅色 / 夜晚深色自动切换 |
 
 ---
@@ -34,10 +38,12 @@
 | **包管理** | `uv`（Rust 编写，替代 pip/venv） |
 | **数据库** | PostgreSQL 16 + pgvector · SQLAlchemy 2.0（全异步 asyncpg） |
 | **LLM 适配** | Anthropic SDK · OpenAI SDK（兼容 DeepSeek / Qwen / vLLM 等） |
+| **MCP 协议** | 自实现 HTTP + SSE 传输层，支持工具提供者与 Chat Agent 双模式 |
 | **本地嵌入** | fastembed + ONNX Runtime（默认 `BAAI/bge-small-zh-v1.5`，无需 PyTorch） |
 | **文件解析** | pypdf · python-docx · openpyxl |
+| **网络搜索** | duckduckgo-search · httpx（Tavily / Serper.dev） |
 | **配置校验** | Pydantic v2 · pydantic-settings |
-| **日志** | Loguru |
+| **日志** | Loguru（主日志 + 对外请求专用日志双轨） |
 
 ---
 
@@ -73,20 +79,22 @@ uv run streamlit run app.py
 agent_nexus_j/
 ├── main.py                      # 后端启动入口
 ├── app.py                       # Streamlit 前端控制台
+├── mock_mcp_server.py           # 本地测试用 MCP Server（echo / get_time / calculator / chat）
 ├── pyproject.toml               # 依赖配置（uv）
 ├── docker-compose.yml           # PostgreSQL + pgvector 容器
 └── api/app/
-    ├── core/                    # 配置、日志
+    ├── core/                    # 配置、日志（主日志 + outbound 日志）
     ├── domain/schemas.py        # Pydantic 数据模型
     ├── infrastructure/
     │   ├── database/            # SQLAlchemy 模型与会话
-    │   ├── llm/adapters.py      # LLM 适配层（Anthropic / OpenAI 兼容）
+    │   ├── llm/adapters.py      # LLM 适配层（Anthropic / OpenAI 兼容，含 ThinkingChunk 流式）
     │   ├── embedding/           # 本地嵌入服务（fastembed）
     │   ├── files/processor.py   # 多模态文件提取
+    │   ├── mcp/                 # MCP 协议层（连接管理 / 状态机 / 工具注册）
     │   └── tools/               # 内置工具 + HTTP 工具注册
     ├── application/
-    │   ├── agent_orchestrator.py       # 单模型 Agent 编排
-    │   ├── collaboration_orchestrator.py # 多模型协作编排
+    │   ├── agent_orchestrator.py       # 单模型 Agent 编排（含 MCP 工具注入、深度思考）
+    │   ├── collaboration_orchestrator.py # 多模型协作编排（支持 MCP Agent 槽位）
     │   └── rag_pipeline.py             # RAG 摄取与检索
-    └── api/routers/             # FastAPI 路由（chat / sessions / knowledge / …）
+    └── api/routers/             # FastAPI 路由（chat / sessions / knowledge / mcp-servers / …）
 ```

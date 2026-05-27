@@ -8,6 +8,7 @@ LLM 适配层：统一 Anthropic 和 OpenAI 兼容接口。
 from __future__ import annotations
 
 import json
+import time
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
@@ -16,7 +17,42 @@ from typing import Union
 import anthropic
 from openai import AsyncOpenAI
 
+from api.app.core.logger import outbound_logger
 from api.app.infrastructure.database.models import LLMConfig
+
+_CONTENT_PREVIEW = 400   # 每条消息内容最大预览字符数
+
+
+def _preview_messages(messages: list[dict]) -> str:
+    """将消息列表压缩为可读摘要，用于对外请求日志。"""
+    lines = []
+    for m in messages:
+        role = m.get("role", "?")
+        content = m.get("content", "")
+        if isinstance(content, str):
+            text = content[:_CONTENT_PREVIEW] + ("…" if len(content) > _CONTENT_PREVIEW else "")
+        elif isinstance(content, list):
+            parts = []
+            for b in content:
+                if not isinstance(b, dict):
+                    continue
+                btype = b.get("type", "?")
+                if btype == "text":
+                    t = b.get("text", "")
+                    parts.append(t[:100] + ("…" if len(t) > 100 else ""))
+                elif btype in ("image", "image_url"):
+                    parts.append("[image]")
+                elif btype == "tool_use":
+                    parts.append(f"[tool_use: {b.get('name')}]")
+                elif btype == "tool_result":
+                    parts.append(f"[tool_result: {str(b.get('content',''))[:80]}]")
+                else:
+                    parts.append(f"[{btype}]")
+            text = " | ".join(parts)
+        else:
+            text = str(content)[:_CONTENT_PREVIEW]
+        lines.append(f"    [{role}] {text!r}")
+    return "\n".join(lines)
 
 
 # ── 数据结构 ──────────────────────────────────────────────────────────────────
@@ -37,7 +73,13 @@ class StreamTurn:
     reasoning_content: str = ""  # DeepSeek thinking 模式，必须原样传回 API
 
 
-StreamItem = Union[str, StreamTurn]
+@dataclass
+class ThinkingChunk:
+    """深度思考增量片段，在 text 内容之前流式 yield。"""
+    content: str
+
+
+StreamItem = Union[str, StreamTurn, ThinkingChunk]
 
 
 # ── 基类 ──────────────────────────────────────────────────────────────────────
@@ -55,6 +97,7 @@ class BaseLLMAdapter(ABC):
         messages: list[dict],
         system: str,
         max_tokens: int,
+        thinking: bool = False,
     ) -> AsyncGenerator[StreamItem, None]:
         """
         流式生成。依次 yield str（文本块），最后 yield StreamTurn（终止标志）。
@@ -97,8 +140,9 @@ class AnthropicAdapter(BaseLLMAdapter):
             kwargs["base_url"] = config.base_url
         self.client = anthropic.AsyncAnthropic(**kwargs)
 
-    async def stream(self, messages, system, max_tokens):
+    async def stream(self, messages, system, max_tokens, thinking: bool = False):
         text = ""
+        thinking_text = ""
         kwargs: dict = {
             "model": self.config.model,
             "max_tokens": max_tokens,
@@ -107,11 +151,47 @@ class AnthropicAdapter(BaseLLMAdapter):
         }
         if system:
             kwargs["system"] = system
+        if thinking:
+            kwargs["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": self.config.thinking_budget,
+            }
+            # 开启 thinking 时工具调用不可用，清除 tools 避免 API 报错
+            kwargs.pop("tools", None)
+
+        _tool_names = [t["name"] for t in self.anthropic_tools]
+        outbound_logger.info(
+            f"LLM ▶ STREAM  provider=anthropic  model={self.config.model}  "
+            f"messages={len(messages)}  tools={_tool_names}  "
+            f"thinking={thinking}  max_tokens={max_tokens}\n"
+            + (f"  system: {system[:200]!r}{'…' if system and len(system) > 200 else ''}\n" if system else "")
+            + _preview_messages(messages)
+        )
+        _t0 = time.monotonic()
+
         async with self.client.messages.stream(**kwargs) as s:
-            async for chunk in s.text_stream:
-                text += chunk
-                yield chunk
+            async for event in s:
+                etype = getattr(event, "type", None)
+                if etype == "content_block_delta":
+                    delta = event.delta
+                    dtype = getattr(delta, "type", None)
+                    if dtype == "thinking_delta":
+                        chunk = getattr(delta, "thinking", "")
+                        thinking_text += chunk
+                        yield ThinkingChunk(content=chunk)
+                    elif dtype == "text_delta":
+                        chunk = getattr(delta, "text", "")
+                        text += chunk
+                        yield chunk
             final = await s.get_final_message()
+
+        _dur = time.monotonic() - _t0
+        _in  = getattr(final.usage, "input_tokens", 0)
+        _out = getattr(final.usage, "output_tokens", 0)
+        outbound_logger.info(
+            f"LLM ◀ STREAM  provider=anthropic  model={self.config.model}  "
+            f"stop={final.stop_reason}  in={_in}  out={_out}  duration={_dur:.2f}s"
+        )
 
         yield StreamTurn(
             text=text,
@@ -121,10 +201,8 @@ class AnthropicAdapter(BaseLLMAdapter):
                 if b.type == "tool_use"
             ],
             stop_reason=final.stop_reason or "end_turn",
-            usage={
-                "input_tokens": getattr(final.usage, "input_tokens", 0),
-                "output_tokens": getattr(final.usage, "output_tokens", 0),
-            },
+            usage={"input_tokens": _in, "output_tokens": _out},
+            reasoning_content=thinking_text,
         )
 
     async def complete(self, messages, system, max_tokens):
@@ -136,7 +214,26 @@ class AnthropicAdapter(BaseLLMAdapter):
         }
         if system:
             kwargs["system"] = system
+
+        _tool_names = [t["name"] for t in self.anthropic_tools]
+        outbound_logger.info(
+            f"LLM ▶ COMPLETE  provider=anthropic  model={self.config.model}  "
+            f"messages={len(messages)}  tools={_tool_names}  max_tokens={max_tokens}\n"
+            + (f"  system: {system[:200]!r}{'…' if system and len(system) > 200 else ''}\n" if system else "")
+            + _preview_messages(messages)
+        )
+        _t0 = time.monotonic()
+
         resp = await self.client.messages.create(**kwargs)
+
+        _dur = time.monotonic() - _t0
+        _in  = getattr(resp.usage, "input_tokens", 0)
+        _out = getattr(resp.usage, "output_tokens", 0)
+        outbound_logger.info(
+            f"LLM ◀ COMPLETE  provider=anthropic  model={self.config.model}  "
+            f"stop={resp.stop_reason}  in={_in}  out={_out}  duration={_dur:.2f}s"
+        )
+
         text = "\n".join(b.text for b in resp.content if hasattr(b, "text"))
         tool_calls = [
             ToolCall(id=b.id, name=b.name, input=dict(b.input))
@@ -147,10 +244,7 @@ class AnthropicAdapter(BaseLLMAdapter):
             text=text,
             tool_calls=tool_calls,
             stop_reason=resp.stop_reason or "end_turn",
-            usage={
-                "input_tokens": getattr(resp.usage, "input_tokens", 0),
-                "output_tokens": getattr(resp.usage, "output_tokens", 0),
-            },
+            usage={"input_tokens": _in, "output_tokens": _out},
         )
 
     def format_history(self, history: list[dict]) -> list[dict]:
@@ -217,7 +311,7 @@ class OpenAIAdapter(BaseLLMAdapter):
             for t in anthropic_tools
         ]
 
-    async def stream(self, messages, system, max_tokens):
+    async def stream(self, messages, system, max_tokens, thinking: bool = False):
         full_messages = ([{"role": "system", "content": system}] if system else []) + messages
         kwargs: dict = {
             "model": self.config.model,
@@ -227,6 +321,17 @@ class OpenAIAdapter(BaseLLMAdapter):
         }
         if self.openai_tools:
             kwargs["tools"] = self.openai_tools
+
+        _base = self.config.base_url or "openai"
+        _tool_names = [t["function"]["name"] for t in self.openai_tools]
+        outbound_logger.info(
+            f"LLM ▶ STREAM  provider={_base}  model={self.config.model}  "
+            f"messages={len(full_messages)}  tools={_tool_names}  "
+            f"thinking={thinking}  max_tokens={max_tokens}\n"
+            + (f"  system: {system[:200]!r}{'…' if system and len(system) > 200 else ''}\n" if system else "")
+            + _preview_messages(messages)
+        )
+        _t0 = time.monotonic()
 
         text = ""
         reasoning_text = ""
@@ -239,10 +344,11 @@ class OpenAIAdapter(BaseLLMAdapter):
             choice = chunk.choices[0] if chunk.choices else None
             if choice:
                 delta = choice.delta
-                # reasoning_content：DeepSeek 推理模型思考阶段，不向用户输出
                 rc = getattr(delta, "reasoning_content", None)
                 if rc:
                     reasoning_text += rc
+                    if thinking:
+                        yield ThinkingChunk(content=rc)
                 if delta.content:
                     text += delta.content
                     yield delta.content
@@ -275,10 +381,19 @@ class OpenAIAdapter(BaseLLMAdapter):
                 input_data = {}
             tool_calls.append(ToolCall(id=tc["id"], name=tc["name"], input=input_data))
 
+        _dur = time.monotonic() - _t0
+        _stop = "tool_use" if finish_reason == "tool_calls" else "end_turn"
+        outbound_logger.info(
+            f"LLM ◀ STREAM  provider={_base}  model={self.config.model}  "
+            f"stop={_stop}  in={usage.get('input_tokens', 0)}  "
+            f"out={usage.get('output_tokens', 0)}  duration={_dur:.2f}s"
+            + (f"  reasoning={len(reasoning_text)}chars" if reasoning_text else "")
+        )
+
         yield StreamTurn(
             text=text,
             tool_calls=tool_calls,
-            stop_reason="tool_use" if finish_reason == "tool_calls" else "end_turn",
+            stop_reason=_stop,
             usage=usage,
             reasoning_content=reasoning_text,
         )
@@ -293,8 +408,28 @@ class OpenAIAdapter(BaseLLMAdapter):
         if self.openai_tools:
             kwargs["tools"] = self.openai_tools
 
+        _base = self.config.base_url or "openai"
+        _tool_names = [t["function"]["name"] for t in self.openai_tools]
+        outbound_logger.info(
+            f"LLM ▶ COMPLETE  provider={_base}  model={self.config.model}  "
+            f"messages={len(full_messages)}  tools={_tool_names}  max_tokens={max_tokens}\n"
+            + (f"  system: {system[:200]!r}{'…' if system and len(system) > 200 else ''}\n" if system else "")
+            + _preview_messages(messages)
+        )
+        _t0 = time.monotonic()
+
         resp = await self.client.chat.completions.create(**kwargs)
+
+        _dur = time.monotonic() - _t0
+        _in  = resp.usage.prompt_tokens if resp.usage else 0
+        _out = resp.usage.completion_tokens if resp.usage else 0
         choice = resp.choices[0]
+        _stop = "tool_use" if choice.finish_reason == "tool_calls" else "end_turn"
+        outbound_logger.info(
+            f"LLM ◀ COMPLETE  provider={_base}  model={self.config.model}  "
+            f"stop={_stop}  in={_in}  out={_out}  duration={_dur:.2f}s"
+        )
+
         text = choice.message.content or ""
         rc = getattr(choice.message, "reasoning_content", None) or ""
         tool_calls = []
@@ -309,11 +444,8 @@ class OpenAIAdapter(BaseLLMAdapter):
         return StreamTurn(
             text=text or rc,  # reasoning-only 模型 content 为空时用 thinking 兜底
             tool_calls=tool_calls,
-            stop_reason="tool_use" if choice.finish_reason == "tool_calls" else "end_turn",
-            usage={
-                "input_tokens": resp.usage.prompt_tokens if resp.usage else 0,
-                "output_tokens": resp.usage.completion_tokens if resp.usage else 0,
-            },
+            stop_reason=_stop,
+            usage={"input_tokens": _in, "output_tokens": _out},
             reasoning_content=rc,
         )
 

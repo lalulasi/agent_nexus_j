@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.app.api.routers import chat, knowledge, llm_configs, sessions, system_prompts, tools
+from api.app.api.routers import chat, knowledge, llm_configs, mcp_servers, search_config, sessions, system_prompts, tools
 from api.app.core.config import get_settings
 from api.app.core.logger import logger, setup_logger
 from api.app.infrastructure.database.session import AsyncSessionLocal, init_db
@@ -47,8 +47,13 @@ async def lifespan(app: FastAPI):
     await _seed_builtin_tools()
     from api.app.infrastructure.embedding.local_service import preload_default_model
     await preload_default_model()
+    # 启动 MCP 连接池
+    from api.app.infrastructure.mcp.manager import get_mcp_manager
+    async with AsyncSessionLocal() as db:
+        await get_mcp_manager().startup(db)
     yield
     logger.info("Shutting down AgentNexus-J")
+    await get_mcp_manager().shutdown()
 
 
 app = FastAPI(
@@ -74,8 +79,23 @@ app.include_router(tools.router, prefix="/api/v1")
 app.include_router(sessions.router, prefix="/api/v1")
 app.include_router(chat.router, prefix="/api/v1")
 app.include_router(knowledge.router, prefix="/api/v1")
+app.include_router(mcp_servers.router, prefix="/api/v1")
+app.include_router(search_config.router, prefix="/api/v1")
 
 
 @app.get("/health")
 async def health():
     return {"status": "ok", "env": settings.app_env.value}
+
+
+# ── 创新点1占位：平台双身份 MCP Server ─────────────────────────────────────────
+# 未来：在此路由下实现 SSE endpoint，暴露 collaborate / query_knowledge 等工具
+# 参考：api/app/infrastructure/mcp/host.py
+@app.api_route("/mcp", methods=["GET", "POST"])
+@app.api_route("/mcp/{path:path}", methods=["GET", "POST"])
+async def mcp_host_stub():
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        status_code=501,
+        content={"detail": "MCP Host Server 尚未实现（创新点1，待排期）"},
+    )

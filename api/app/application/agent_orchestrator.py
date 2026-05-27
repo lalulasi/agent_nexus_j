@@ -1,6 +1,7 @@
 import json
 import uuid
 from collections.abc import AsyncGenerator
+from datetime import date
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,11 +12,13 @@ from api.app.application.rag_pipeline import RAGPipeline
 from api.app.core.config import get_settings
 from api.app.core.logger import logger
 from api.app.domain.schemas import ChatResponse, MessageOut
-from api.app.infrastructure.database.models import AgentSession, LLMConfig, Message, UserTool
-from api.app.infrastructure.llm.adapters import StreamTurn, make_adapter
+from api.app.infrastructure.database.models import AgentSession, LLMConfig, Message, SearchConfig, UserTool
+from api.app.infrastructure.llm.adapters import StreamTurn, ThinkingChunk, make_adapter
 from api.app.infrastructure.tools.base import BaseTool
 from api.app.infrastructure.tools.http_tool import HttpTool
+from api.app.infrastructure.mcp.manager import get_mcp_manager
 from api.app.infrastructure.tools.registry import get_tool
+from api.app.infrastructure.tools.builtins.search_tool import SearchTool
 
 settings = get_settings()
 
@@ -28,7 +31,7 @@ class AgentOrchestrator:
 
     # ── 工具加载（每次请求从 DB 读取激活工具） ────────────────────────────────
 
-    async def _load_tools(self) -> None:
+    async def _load_tools(self, search: bool = False) -> None:
         result = await self.db.execute(
             sa_select(UserTool).where(UserTool.is_active == True)
         )
@@ -46,9 +49,32 @@ class AgentOrchestrator:
                     executors[r.name] = builtin
             elif r.tool_type == "http" and r.http_url:
                 executors[r.name] = HttpTool(r)
+        # 仅在前端请求开启搜索时注入搜索工具
+        if search:
+            search_result = await self.db.execute(
+                sa_select(SearchConfig).where(SearchConfig.is_active == True)
+            )
+            search_cfg = search_result.scalar_one_or_none()
+            if search_cfg:
+                search_tool = SearchTool(search_cfg)
+                defs.append({
+                    "name": search_tool.name,
+                    "description": search_tool.description,
+                    "input_schema": search_tool.input_schema,
+                })
+                executors[search_tool.name] = search_tool
+                logger.debug(f"搜索工具已注入 LLM 上下文: {search_cfg.provider}")
+
+        # 追加 MCP 工具定义（MCP 工具通过 manager 执行，不放 executors）
+        mcp_defs = get_mcp_manager().get_all_mcp_tools()
+        defs.extend(mcp_defs)
+
         self._tool_defs = defs
         self._executors = executors
-        logger.debug(f"已加载工具: {list(executors.keys())}")
+        if mcp_defs:
+            logger.info(f"MCP 工具已注入 LLM 上下文: {[d['name'] for d in mcp_defs]}")
+        else:
+            logger.debug(f"已加载工具: {list(executors.keys())} (无 MCP 工具)")
 
     # ── RAG 检索 ──────────────────────────────────────────────────────────────
 
@@ -70,7 +96,7 @@ class AgentOrchestrator:
 
         await self._save_message(session.id, "user", user_message)
         messages = adapter.format_history(self._build_history(session, user_message))
-        system = self._get_effective_system(session)
+        system = self._get_effective_system(session)  # run() 不含搜索，has_search=False
         final_text, usage = await self._loop(adapter, messages, system)
 
         saved = await self._save_message(
@@ -92,8 +118,10 @@ class AgentOrchestrator:
         config: LLMConfig,
         attachments: list[dict] | None = None,
         is_retry: bool = False,
+        thinking: bool = False,
+        search: bool = False,
     ) -> AsyncGenerator[str, None]:
-        await self._load_tools()
+        await self._load_tools(search=search)
         adapter = make_adapter(config, self._tool_defs)
 
         if not is_retry:
@@ -114,7 +142,8 @@ class AgentOrchestrator:
                 new_attachments=attachments or [],
             )
         )
-        system = self._get_effective_system(session)
+        has_search = "web_search" in {d["name"] for d in self._tool_defs}
+        system = self._get_effective_system(session, has_search=has_search)
 
         # RAG：检索相关切片并注入 system prompt
         if session.rag_enabled:
@@ -135,8 +164,10 @@ class AgentOrchestrator:
             turn: StreamTurn | None = None
 
             try:
-                async for item in adapter.stream(messages, system, settings.agent_max_tokens):
-                    if isinstance(item, str):
+                async for item in adapter.stream(messages, system, settings.agent_max_tokens, thinking=thinking):
+                    if isinstance(item, ThinkingChunk):
+                        yield json.dumps({"type": "thinking", "content": item.content})
+                    elif isinstance(item, str):
                         iter_text += item
                         yield json.dumps({"type": "text", "content": item})
                     elif isinstance(item, StreamTurn):
@@ -163,15 +194,24 @@ class AgentOrchestrator:
 
                 tool_outputs: dict[str, str] = {}
                 results: list[str] = []
+                mcp_mgr = get_mcp_manager()
                 for tc in turn.tool_calls:
-                    executor = self._executors.get(tc.name)
-                    if executor:
-                        try:
-                            result = await executor.run(**tc.input)
-                        except Exception as e:
-                            result = f"工具执行错误: {e}"
-                    else:
-                        result = f"未知工具: {tc.name}"
+                    try:
+                        if mcp_mgr.is_mcp_tool(tc.name):
+                            # MCP 工具：解析前缀，通过 manager 调用
+                            srv_name, tool_name = mcp_mgr.parse_mcp_tool_name(tc.name)
+                            mcp_result = await mcp_mgr.call_tool(srv_name, tool_name, tc.input)
+                            result = mcp_result.content
+                            if mcp_result.is_error:
+                                result = f"[工具错误] {result}"
+                        else:
+                            executor = self._executors.get(tc.name)
+                            if executor:
+                                result = await executor.run(**tc.input)
+                            else:
+                                result = f"未知工具: {tc.name}"
+                    except Exception as e:
+                        result = f"工具执行错误: {e}"
                     tool_outputs[tc.id] = str(result)
                     results.append(str(result))
                     logger.info(f"工具 '{tc.name}' → {str(result)[:120]}")
@@ -293,8 +333,25 @@ class AgentOrchestrator:
             })
         return history
 
-    def _get_effective_system(self, session: AgentSession) -> str | None:
+    def _get_effective_system(self, session: AgentSession, has_search: bool = False) -> str | None:
         base = session.system_prompt_ref.content if session.system_prompt_ref else None
+
+        # 始终注入当前日期，让模型知道"今天"是哪天，避免把当前日期误判为未来
+        today_str = date.today().strftime("%Y年%m月%d日")
+        date_block = f"当前日期：{today_str}。"
+
+        # 搜索工具提示：有 web_search 工具时，提示模型主动使用
+        search_hint = (
+            "你拥有 web_search 工具，可以搜索互联网获取实时信息。"
+            "遇到近期事件、新闻、最新数据等超出训练知识范围的问题时，"
+            "务必主动调用 web_search 工具获取最新内容，而不是拒绝回答或说不知道。"
+        ) if has_search else ""
+
+        prefix_parts = [p for p in [date_block, search_hint] if p]
+        prefix = " ".join(prefix_parts)
+
+        base_with_prefix = (prefix + "\n\n" + base) if base else prefix
+
         summary_msg = next(
             (m for m in reversed(session.messages) if m.role == "summary"), None
         )
@@ -303,8 +360,8 @@ class AgentOrchestrator:
                 f"\n\n---\n以下是本次会话早期对话的摘要，请参考以保持上下文连贯：\n"
                 f"{summary_msg.content}"
             )
-            return (base or "") + block
-        return base
+            return base_with_prefix + block
+        return base_with_prefix
 
     @staticmethod
     def _estimate_tokens(messages: list) -> int:

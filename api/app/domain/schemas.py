@@ -13,6 +13,8 @@ class LLMConfigCreate(BaseModel):
     base_url: str | None = None
     embedding_model: str | None = None
     embedding_dimensions: int | None = None
+    thinking_enabled: bool = False
+    thinking_budget: int = Field(default=8000, ge=1024, le=32000)
 
 
 class LLMConfigUpdate(BaseModel):
@@ -22,6 +24,8 @@ class LLMConfigUpdate(BaseModel):
     base_url: str | None = None  # 空字符串清除
     embedding_model: str | None = None
     embedding_dimensions: int | None = None
+    thinking_enabled: bool | None = None
+    thinking_budget: int | None = Field(default=None, ge=1024, le=32000)
 
 
 class LLMConfigOut(BaseModel):
@@ -33,6 +37,8 @@ class LLMConfigOut(BaseModel):
     is_active: bool
     embedding_model: str | None
     embedding_dimensions: int | None
+    thinking_enabled: bool
+    thinking_budget: int
     created_at: datetime
     updated_at: datetime
 
@@ -51,6 +57,8 @@ class LLMConfigOut(BaseModel):
             is_active=obj.is_active,
             embedding_model=obj.embedding_model,
             embedding_dimensions=obj.embedding_dimensions,
+            thinking_enabled=obj.thinking_enabled,
+            thinking_budget=obj.thinking_budget,
             created_at=obj.created_at,
             updated_at=obj.updated_at,
         )
@@ -218,12 +226,58 @@ class ChatRequest(BaseModel):
     stream: bool = False
     attachments: list[AttachmentIn] = Field(default_factory=list)
     is_retry: bool = False
+    thinking: bool = False   # 每次对话由前端按需传入，不依赖模型配置
+    search: bool = False     # 每次对话由前端按需传入，控制是否注入搜索工具
 
 
 class ChatResponse(BaseModel):
     session_id: uuid.UUID
     message: MessageOut
     usage: dict | None = None
+
+
+# ── SearchConfig ──────────────────────────────────────────────────────────────
+
+class SearchConfigCreate(BaseModel):
+    provider: str = Field(default="ddgs", pattern=r"^(ddgs|tavily|serper)$")
+    api_key: str | None = None
+    max_results: int = Field(default=5, ge=1, le=20)
+
+
+class SearchConfigUpdate(BaseModel):
+    provider: str | None = Field(default=None, pattern=r"^(ddgs|tavily|serper)$")
+    api_key: str | None = None
+    max_results: int | None = Field(default=None, ge=1, le=20)
+    is_active: bool | None = None
+
+
+class SearchConfigOut(BaseModel):
+    id: uuid.UUID
+    provider: str
+    api_key_masked: str | None
+    max_results: int
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+    @classmethod
+    def from_orm_mask(cls, obj) -> "SearchConfigOut":
+        key = obj.api_key
+        if key:
+            masked = key[:4] + "****" + key[-4:] if len(key) > 8 else "****"
+        else:
+            masked = None
+        return cls(
+            id=obj.id,
+            provider=obj.provider,
+            api_key_masked=masked,
+            max_results=obj.max_results,
+            is_active=obj.is_active,
+            created_at=obj.created_at,
+            updated_at=obj.updated_at,
+        )
 
 
 # ── Knowledge ─────────────────────────────────────────────────────────────────

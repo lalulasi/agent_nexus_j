@@ -140,11 +140,49 @@ def api(method: str, path: str, silent: bool = False, **kwargs):
     return None
 
 
+def _iter_raw_chat_events(
+    session_id: str,
+    message: str,
+    attachments: list[dict] | None = None,
+    is_retry: bool = False,
+    thinking: bool = False,
+    search: bool = False,
+):
+    """底层生成器：逐个 yield 原始 SSE payload dict，供有 thinking 的手动渲染循环使用。"""
+    with httpx.stream(
+        "POST",
+        f"{API_BASE}/chat/stream",
+        json={
+            "session_id": session_id,
+            "message": message,
+            "attachments": attachments or [],
+            "is_retry": is_retry,
+            "thinking": thinking,
+            "search": search,
+        },
+        timeout=180,
+    ) as resp:
+        if resp.status_code != 200:
+            yield {"type": "error", "message": f"请求失败 ({resp.status_code})"}
+            return
+        for line in resp.iter_lines():
+            if not line.startswith("data: "):
+                continue
+            raw = line[6:]
+            if raw == "[DONE]":
+                return
+            try:
+                yield json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+
+
 def stream_chat(
     session_id: str,
     message: str,
     attachments: list[dict] | None = None,
     is_retry: bool = False,
+    search: bool = False,
 ):
     """同步生成器，供 st.write_stream() 消费（普通会话）。"""
     with httpx.stream(
@@ -155,6 +193,7 @@ def stream_chat(
             "message": message,
             "attachments": attachments or [],
             "is_retry": is_retry,
+            "search": search,
         },
         timeout=180,
     ) as resp:
@@ -185,6 +224,13 @@ def stream_chat(
                         wd = inp.get("working_dir", "")
                         header = f"🖥 **执行命令**" + (f"  `{wd}`" if wd else "")
                         blocks.append(f"{header}\n```shell\n{cmd}\n```")
+                    elif name.startswith("mcp__"):
+                        # mcp__{server_name}__{tool_name}
+                        parts = name.split("__", 2)
+                        srv = parts[1] if len(parts) > 1 else ""
+                        tool = parts[2] if len(parts) > 2 else name
+                        args_str = ", ".join(f"`{k}`={repr(v)}" for k, v in inp.items()) if inp else "无参数"
+                        blocks.append(f"🔌 **MCP [{srv}]** · `{tool}`\n\n> {args_str}")
                     else:
                         label = {
                             "get_system_time": "🕐 获取系统时间",
@@ -384,6 +430,7 @@ for _k, _v in [
     ("active_session_id", None),
     ("chat_history", []),
     ("editing_config_id", None),
+    ("confirm_delete_config_id", None),
     ("renaming_session_id", None),
     ("selected_sp_id", None),         # 当前侧边栏选中的 system prompt id
     ("editing_sp_id", None),          # 正在编辑的 system prompt id
@@ -431,6 +478,9 @@ with st.sidebar:
 
     configs: list[dict] = api("GET", "/llm-configs/", silent=True) or []
     active_config = next((c for c in configs if c["is_active"]), None)
+    _mcp_servers: list[dict] = api("GET", "/mcp-servers/", silent=True) or []
+    search_configs: list[dict] = api("GET", "/search-config/", silent=True) or []
+    _active_search = next((s for s in search_configs if s["is_active"]), None)
 
     tab_chat, tab_model, tab_tools, tab_kb = st.tabs(["💬 会话", "⚙️ 模型", "🛠 工具", "📚 知识库"])
 
@@ -451,6 +501,11 @@ with st.sidebar:
                     help="首次选择非默认模型时，后端会从 HuggingFace 下载 ONNX 文件并缓存本地，之后离线可用。",
                 )
                 n_emb_model = _EMB_OPTIONS[n_emb_label]
+                n_thinking_budget = st.slider(
+                    "思考 Token 预算（Anthropic 扩展思考专用）",
+                    min_value=1024, max_value=32000, value=8000, step=1024,
+                    help="仅对 Anthropic Claude 系列的深度思考生效；DeepSeek 等模型由自身控制思考深度。",
+                )
                 submitted = st.form_submit_button("💾 保存并激活", use_container_width=True, type="primary")
             if submitted:
                 if not n_name or not n_model or not n_key:
@@ -460,6 +515,7 @@ with st.sidebar:
                         "display_name": n_name, "model": n_model,
                         "api_key": n_key, "base_url": n_url or None,
                         "embedding_model": n_emb_model,
+                        "thinking_budget": n_thinking_budget,
                     })
                     if result:
                         st.success(f"✅ 已接入并激活：{result['display_name']}")
@@ -479,20 +535,44 @@ with st.sidebar:
             )
             selected = options_map[selected_label]
 
-            col_act, col_edit = st.columns(2)
+            col_act, col_edit, col_del = st.columns([3, 2, 1])
             if not selected["is_active"]:
                 if col_act.button("⚡ 激活", use_container_width=True, type="primary"):
                     api("POST", f"/llm-configs/{selected['id']}/activate")
+                    st.session_state.confirm_delete_config_id = None
                     st.rerun()
             else:
-                col_act.success("已激活 ✅")
+                col_act.caption("✅ 已激活")
 
             if col_edit.button("✏️ 编辑", use_container_width=True):
                 st.session_state.editing_config_id = (
                     None if st.session_state.editing_config_id == selected["id"]
                     else selected["id"]
                 )
+                st.session_state.confirm_delete_config_id = None
                 st.rerun()
+
+            _is_del_confirm = st.session_state.confirm_delete_config_id == selected["id"]
+            if col_del.button(
+                "🗑",
+                use_container_width=True,
+                help="删除此模型配置" if not selected["is_active"] else "请先激活其他模型再删除此配置",
+                disabled=selected["is_active"],
+            ):
+                st.session_state.confirm_delete_config_id = selected["id"]
+                st.rerun()
+
+            if _is_del_confirm:
+                st.warning(f"确认删除「{selected['display_name']}」？此操作不可撤销。")
+                _dc1, _dc2 = st.columns(2)
+                if _dc1.button("确认删除", type="primary", use_container_width=True):
+                    api("DELETE", f"/llm-configs/{selected['id']}")
+                    st.session_state.confirm_delete_config_id = None
+                    st.session_state.editing_config_id = None
+                    st.rerun()
+                if _dc2.button("取消", use_container_width=True):
+                    st.session_state.confirm_delete_config_id = None
+                    st.rerun()
 
             if st.session_state.editing_config_id == selected["id"]:
                 with st.form(f"edit_config_{selected['id']}"):
@@ -513,6 +593,11 @@ with st.sidebar:
                         help="首次选择非默认模型时，后端从 HuggingFace 下载 ONNX 文件并缓存本地。",
                     )
                     e_emb_model = _EMB_OPTIONS[e_emb_label]
+                    e_thinking_budget = st.slider(
+                        "思考 Token 预算（Anthropic 扩展思考专用）",
+                        min_value=1024, max_value=32000,
+                        value=selected.get("thinking_budget", 8000), step=1024,
+                    )
                     s_col, c_col = st.columns(2)
                     save = s_col.form_submit_button("💾 保存", use_container_width=True, type="primary")
                     cancel = c_col.form_submit_button("取消", use_container_width=True)
@@ -527,6 +612,7 @@ with st.sidebar:
                         payload["api_key"] = e_key
                     payload["base_url"] = e_url.strip() or ""
                     payload["embedding_model"] = e_emb_model or ""
+                    payload["thinking_budget"] = e_thinking_budget
                     result = api("PATCH", f"/llm-configs/{selected['id']}", json=payload)
                     if result:
                         st.session_state.editing_config_id = None
@@ -749,6 +835,185 @@ with st.sidebar:
         else:
             st.caption("暂无工具，重启后端后内置工具将自动同步。")
 
+        # ── 搜索引擎配置区块 ──────────────────────────────────────────────────
+        st.divider()
+        st.subheader("🔍 网络搜索")
+        st.caption("配置搜索引擎后，在会话输入框旁可按消息开关搜索。DuckDuckGo 无需 API Key，开箱即用。")
+
+        _provider_labels = {"ddgs": "DuckDuckGo（免费，无需 Key）", "tavily": "Tavily", "serper": "Serper.dev"}
+
+        with st.expander("＋ 添加搜索配置"):
+            with st.form("new_search_form", clear_on_submit=True):
+                sc_provider = st.selectbox(
+                    "搜索提供商 *",
+                    options=["ddgs", "tavily", "serper"],
+                    format_func=lambda x: _provider_labels.get(x, x),
+                )
+                sc_key = st.text_input(
+                    "API Key",
+                    type="password",
+                    placeholder="DuckDuckGo 不需要；Tavily/Serper 必填",
+                )
+                sc_max = st.slider("最多返回结果数", min_value=1, max_value=10, value=5)
+                if st.form_submit_button("💾 保存", use_container_width=True, type="primary"):
+                    if sc_provider in ("tavily", "serper") and not sc_key.strip():
+                        st.error(f"{sc_provider} 需要配置 API Key")
+                    else:
+                        r = api("POST", "/search-config/", json={
+                            "provider": sc_provider,
+                            "api_key": sc_key.strip() or None,
+                            "max_results": sc_max,
+                        })
+                        if r:
+                            st.success(f"✅ 搜索配置已保存：{_provider_labels.get(sc_provider, sc_provider)}")
+                            st.rerun()
+
+        if search_configs:
+            # 顶部选择器：直接决定使用哪个引擎，无需手动激活
+            _sc_options = {sc["id"]: _provider_labels.get(sc["provider"], sc["provider"]) for sc in search_configs}
+            _sc_active_id = _active_search["id"] if _active_search else None
+            _sc_sel_label = st.selectbox(
+                "当前使用的搜索引擎",
+                options=list(_sc_options.keys()),
+                index=list(_sc_options.keys()).index(_sc_active_id) if _sc_active_id in _sc_options else 0,
+                format_func=lambda x: _sc_options[x],
+                key="search_engine_select",
+            )
+            if _sc_sel_label != _sc_active_id:
+                api("POST", f"/search-config/{_sc_sel_label}/activate")
+                st.rerun()
+
+            st.caption(f"最多返回 {next(s['max_results'] for s in search_configs if s['id'] == _sc_sel_label)} 条结果")
+
+            for sc in search_configs:
+                _sc_label = _provider_labels.get(sc["provider"], sc["provider"])
+                sc_col_info, sc_col_del = st.columns([6, 1])
+                _key_info = f"`Key: {sc['api_key_masked']}`" if sc["api_key_masked"] else "`无需 Key`"
+                sc_col_info.caption(f"**{_sc_label}** · {_key_info} · 最多 {sc['max_results']} 条")
+                if sc_col_del.button("🗑", key=f"sc_del_{sc['id']}", help="删除",
+                                     disabled=(sc["id"] == _sc_sel_label and len(search_configs) == 1)):
+                    api("DELETE", f"/search-config/{sc['id']}")
+                    st.rerun()
+        else:
+            st.caption("暂未配置搜索引擎。DuckDuckGo 无需任何 Key，可直接添加即用。")
+
+        # ── MCP Agent 区块 ────────────────────────────────────────────────────
+        st.divider()
+        st.subheader("🔌 MCP Agent")
+
+        with st.expander("＋ 接入 MCP Server"):
+            with st.form("new_mcp_form", clear_on_submit=True):
+                m_name = st.text_input(
+                    "名称 *（小写字母+下划线，作工具前缀）",
+                    placeholder="如 rag_agent",
+                )
+                m_display = st.text_input("显示名称 *", placeholder="如 合同审查助手")
+                m_desc = st.text_area("描述", height=60,
+                                      placeholder="告知 LLM 该 Agent 的用途与触发场景")
+                m_url = st.text_input(
+                    "URL *",
+                    placeholder="http://your-server.com/sse",
+                )
+                m_auth = st.text_input("认证头（可选）", placeholder="Bearer sk-xxx",
+                                       type="password")
+                m_mode = st.selectbox("接入模式", [
+                    "tool_provider（仅提供工具）",
+                    "chat_agent（仅对话 Agent）",
+                    "both（工具 + 对话 Agent）",
+                ])
+                m_mode_val = m_mode.split("（")[0]
+                if st.form_submit_button("测试并注册", use_container_width=True, type="primary"):
+                    errs = []
+                    if not m_name.strip():
+                        errs.append("名称不能为空")
+                    if not m_display.strip():
+                        errs.append("显示名称不能为空")
+                    if not m_url.strip():
+                        errs.append("URL 不能为空")
+                    if errs:
+                        for e in errs:
+                            st.error(e)
+                    else:
+                        r = api("POST", "/mcp-servers/", json={
+                            "name": m_name.strip(),
+                            "display_name": m_display.strip(),
+                            "description": m_desc.strip(),
+                            "url": m_url.strip(),
+                            "auth_header": m_auth.strip() or None,
+                            "mode": m_mode_val,
+                        })
+                        if r:
+                            st.success(f"✅ {m_display.strip()} 已注册，正在建立连接...")
+                            st.rerun()
+
+        _STATUS_ICON = {
+            "connected":    "🟢",
+            "connecting":   "🟡",
+            "reconnecting": "🟡",
+            "disconnected": "🔴",
+            "disabled":     "⚫",
+            "error":        "🔴",
+        }
+        _STATUS_TEXT = {
+            "connected":    "已连接",
+            "connecting":   "连接中…",
+            "reconnecting": "重连中…",
+            "disconnected": "已断开",
+            "disabled":     "已禁用",
+            "error":        "连接错误",
+        }
+        _MODE_LABEL = {
+            "tool_provider": "工具",
+            "chat_agent":    "Agent",
+            "both":          "工具+Agent",
+        }
+
+        if _mcp_servers:
+            for _ms in _mcp_servers:
+                _icon        = _STATUS_ICON.get(_ms.get("status", ""), "⚫")
+                _status_text = _STATUS_TEXT.get(_ms.get("status", ""), "未知")
+                _tools_count = len(_ms.get("discovered_tools") or [])
+                _mode_label  = _MODE_LABEL.get(_ms.get("mode", ""), _ms.get("mode", ""))
+
+                with st.container(border=True):
+                    # ── 主信息行 ──────────────────────────────────────────────
+                    _info_col, _btn_col = st.columns([4, 3])
+                    with _info_col:
+                        st.markdown(f"{_icon} **{_ms['display_name']}**")
+                        _meta = f"`{_ms['name']}` · {_mode_label}"
+                        if _tools_count:
+                            _meta += f" · {_tools_count} 🔧"
+                        st.caption(f"{_status_text}　{_meta}")
+
+                    # ── 操作按钮（全 emoji，不撑宽） ──────────────────────────
+                    with _btn_col:
+                        _b1, _b2, _b3 = st.columns(3)
+                        if _b1.button("🔄", key=f"mcp_ref_{_ms['id']}",
+                                      help="刷新工具列表", use_container_width=True):
+                            _ref = api("POST", f"/mcp-servers/{_ms['id']}/refresh", silent=False)
+                            if _ref:
+                                st.rerun()
+                        _tog      = "⏸" if _ms["is_active"] else "▶"
+                        _tog_help = "禁用" if _ms["is_active"] else "启用"
+                        if _b2.button(_tog, key=f"mcp_act_{_ms['id']}",
+                                      help=_tog_help, use_container_width=True):
+                            api("POST", f"/mcp-servers/{_ms['id']}/activate")
+                            st.rerun()
+                        if _b3.button("🗑", key=f"mcp_del_{_ms['id']}",
+                                      help="删除", use_container_width=True):
+                            api("DELETE", f"/mcp-servers/{_ms['id']}")
+                            st.rerun()
+
+                    # ── 工具列表（折叠） ──────────────────────────────────────
+                    if _tools_count:
+                        with st.expander(f"查看 {_tools_count} 个工具"):
+                            for _t in (_ms.get("discovered_tools") or []):
+                                _desc = _t.get("description", "")
+                                _desc_short = _desc[:50] + "…" if len(_desc) > 50 else _desc
+                                st.caption(f"🔧 `{_t['name']}`　{_desc_short}")
+        else:
+            st.caption("暂无 MCP Server，点击上方注册。")
+
     # ── Tab: 知识库 ──────────────────────────────────────────────────────────
     with tab_kb:
         st.subheader("📚 知识库")
@@ -792,6 +1057,23 @@ with st.sidebar:
 
     # ── Tab: 会话 ────────────────────────────────────────────────────────────
     with tab_chat:
+        # 快速切换当前激活模型
+        if configs:
+            _qs_labels = [f"{c['display_name']} · {c['model']}" for c in configs]
+            _qs_active_idx = next((i for i, c in enumerate(configs) if c["is_active"]), 0)
+            _qs_sel = st.selectbox(
+                "🤖 使用模型",
+                options=_qs_labels,
+                index=_qs_active_idx,
+                key="quick_model_switch",
+            )
+            _qs_cfg = configs[_qs_labels.index(_qs_sel)]
+            if not _qs_cfg["is_active"]:
+                api("POST", f"/llm-configs/{_qs_cfg['id']}/activate")
+                st.rerun()
+        else:
+            st.caption("尚未配置模型 → 前往「⚙️ 模型」tab")
+
         col_new, col_collab = st.columns(2)
         _rag_new_toggle = st.checkbox(
             "🔍 启用 RAG",
@@ -822,8 +1104,25 @@ with st.sidebar:
         if st.session_state.collab_show_form:
             with st.container(border=True):
                 st.caption("⚡ 新建多模型协作会话")
-                if len(configs) < 2:
-                    st.warning("至少需要 2 个模型配置才能使用协作模式。")
+
+                # Build unified slot options: LLM configs + active MCP chat agents
+                _mcp_chat_agents = [
+                    ms for ms in _mcp_servers
+                    if ms.get("mode") in ("chat_agent", "both") and ms.get("is_active")
+                ]
+                # slot_meta: display_label → {type, ...}
+                slot_meta: dict[str, dict] = {}
+                for c in configs:
+                    slot_meta[f"{c['display_name']} · {c['model']}"] = {"type": "llm", "id": c["id"]}
+                for ms in _mcp_chat_agents:
+                    slot_meta[f"[MCP] {ms['display_name']}"] = {
+                        "type": "mcp", "server_name": ms["name"], "display_name": ms["display_name"],
+                    }
+                all_slot_labels = list(slot_meta.keys())
+                llm_labels = [l for l, v in slot_meta.items() if v["type"] == "llm"]
+
+                if len(all_slot_labels) < 2:
+                    st.warning("至少需要 2 个模型/Agent 才能使用协作模式。")
                 else:
                     collab_mode_sel = st.radio(
                         "协作模式",
@@ -833,40 +1132,44 @@ with st.sidebar:
                     )
                     is_round_table = "圆桌" in collab_mode_sel
 
-                    config_options = {f"{c['display_name']} · {c['model']}": c["id"] for c in configs}
-                    config_labels = list(config_options.keys())
-
                     _ROLES_RT = ["proposer（提案者）", "critic（批判者）",
                                   "creative（创意者）", "validator（验证者）", "synthesizer（综合者）"]
                     _ROLE_KEYS = ["proposer", "critic", "creative", "validator", "synthesizer"]
 
                     if is_round_table:
-                        n_models = st.slider("模型数量", min_value=2, max_value=min(5, len(configs)), value=min(3, len(configs)))
+                        n_models = st.slider("槽位数量", min_value=2, max_value=min(5, len(all_slot_labels)), value=min(3, len(all_slot_labels)))
                         rounds_rt = st.radio("讨论轮次", [1, 2], index=1,
                                              format_func=lambda x: f"{x} 轮（{'仅独立作答' if x == 1 else '独立作答 + 交叉审视'}）",
                                              horizontal=True)
-                        st.caption("最后一个槽位固定为综合者，其余按序自动分配角色。")
-                        rt_model_ids = []
+                        st.caption("最后一个槽位固定为综合者，其余按序自动分配角色。MCP Agent 标记 [MCP]。")
+                        rt_slot_labels = []
                         for i in range(n_models):
                             auto_role = _ROLES_RT[min(i, len(_ROLES_RT) - 1)] if i < n_models - 1 else _ROLES_RT[-1]
-                            default_idx = min(i, len(config_labels) - 1)
+                            default_idx = min(i, len(all_slot_labels) - 1)
                             sel = st.selectbox(
                                 f"槽位 {i+1}：{auto_role}",
-                                config_labels,
+                                all_slot_labels,
                                 index=default_idx,
                                 key=f"rt_slot_{i}",
                             )
-                            rt_model_ids.append(config_options[sel])
+                            rt_slot_labels.append(sel)
 
                         sp_id_c = st.session_state.get("selected_sp_id")
                         if st.button("✅ 创建圆桌会话", use_container_width=True, type="primary"):
                             roles = [_ROLE_KEYS[min(i, len(_ROLE_KEYS) - 1)] if i < n_models - 1
                                      else "synthesizer" for i in range(n_models)]
+                            models_cfg = []
+                            for label, role in zip(rt_slot_labels, roles):
+                                info = slot_meta[label]
+                                if info["type"] == "mcp":
+                                    models_cfg.append({"type": "mcp", "server_name": info["server_name"],
+                                                       "display_name": info["display_name"], "role": role})
+                                else:
+                                    models_cfg.append({"type": "llm", "config_id": str(info["id"]), "role": role})
                             collab_cfg = {
                                 "mode": "round_table",
                                 "rounds": rounds_rt,
-                                "models": [{"config_id": str(cid), "role": r}
-                                           for cid, r in zip(rt_model_ids, roles)],
+                                "models": models_cfg,
                             }
                             result = api("POST", "/sessions/", json={
                                 "title": "新会话",
@@ -881,23 +1184,32 @@ with st.sidebar:
                                 st.session_state.collab_show_form = False
                                 st.rerun()
                     else:
-                        st.caption("主模型负责作答，评委模型并行评审打分。")
-                        master_sel = st.selectbox("主模型", config_labels, key="ms_master")
-                        remaining = [l for l in config_labels if l != master_sel] or config_labels
-                        max_rev = min(4, len(remaining))
+                        st.caption("主模型（LLM）负责流式作答，评委可混合 LLM 和 MCP Agent。")
+                        master_sel = st.selectbox("主模型（LLM）", llm_labels or all_slot_labels, key="ms_master")
+                        reviewer_pool = [l for l in all_slot_labels if l != master_sel] or all_slot_labels
+                        max_rev = min(4, len(reviewer_pool))
                         n_rev = st.slider("评委数量", 1, max_rev, min(2, max_rev))
-                        reviewer_ids = []
+                        reviewer_sel_labels = []
                         for i in range(n_rev):
-                            default_idx = min(i, len(remaining) - 1)
-                            sel = st.selectbox(f"评委 {i+1}", remaining, index=default_idx, key=f"ms_rev_{i}")
-                            reviewer_ids.append(config_options[sel])
+                            default_idx = min(i, len(reviewer_pool) - 1)
+                            sel = st.selectbox(f"评委 {i+1}", reviewer_pool, index=default_idx, key=f"ms_rev_{i}")
+                            reviewer_sel_labels.append(sel)
 
                         sp_id_c = st.session_state.get("selected_sp_id")
                         if st.button("✅ 创建主从会话", use_container_width=True, type="primary"):
+                            reviewer_slots = []
+                            for label in reviewer_sel_labels:
+                                info = slot_meta[label]
+                                if info["type"] == "mcp":
+                                    reviewer_slots.append({"type": "mcp", "server_name": info["server_name"],
+                                                           "display_name": info["display_name"]})
+                                else:
+                                    reviewer_slots.append({"type": "llm", "config_id": str(info["id"])})
+                            master_info = slot_meta[master_sel]
                             collab_cfg = {
                                 "mode": "master_slave",
-                                "master_config_id": str(config_options[master_sel]),
-                                "reviewer_config_ids": [str(rid) for rid in reviewer_ids],
+                                "master_config_id": str(master_info["id"]),
+                                "reviewer_slots": reviewer_slots,
                             }
                             result = api("POST", "/sessions/", json={
                                 "title": "新会话",
@@ -1107,6 +1419,30 @@ if not _is_collab and st.session_state.active_session_id:
              "如 Claude 3+、GPT-4o、qwen-vl-max 等，文本类文件对所有模型适用。",
     ) or []
 
+# 深度思考 + 网络搜索 toggle（普通会话才有意义）
+if not _is_collab:
+    _tc, _sc = st.columns(2)
+    _thinking_on = _tc.toggle(
+        "🧠 深度思考",
+        value=st.session_state.get("thinking_mode", False),
+        key="thinking_toggle",
+        help="开启后模型将先进行内部推理再作答，适合复杂分析、数学推导等任务。DeepSeek-R1 / QwQ / Claude 扩展思考均支持。",
+    )
+    _search_default = st.session_state.get("search_mode", False)
+    _search_on = _sc.toggle(
+        "🔍 网络搜索",
+        value=_search_default,
+        key="search_toggle",
+        disabled=not _active_search,
+        help="开启后 LLM 可主动调用搜索引擎获取实时信息。" if _active_search
+             else "请先在「🛠 工具 → 🔍 网络搜索」中配置搜索引擎。",
+    )
+    st.session_state["thinking_mode"] = _thinking_on
+    st.session_state["search_mode"] = _search_on
+else:
+    _thinking_on = False
+    _search_on = False
+
 # 新消息输入
 _input_prompt = st.chat_input(_hint)
 if _input_prompt and not _is_retry:
@@ -1232,14 +1568,89 @@ if _effective_prompt:
     else:
         st.session_state["_compression_happened"] = False
         with st.chat_message("assistant"):
-            reply = st.write_stream(
-                stream_chat(
+            if _thinking_on:
+                # ── Thinking 模式：手动 loop + st.status 展示思考过程 ─────────
+                _thinking_buf = ""
+                _text_buf = ""
+                _status = None
+                _thinking_ph = None
+                _text_ph = st.empty()
+
+                for _p in _iter_raw_chat_events(
                     st.session_state.active_session_id,
                     _effective_prompt,
                     _effective_attachments,
                     is_retry=_is_retry,
+                    thinking=True,
+                    search=_search_on,
+                ):
+                    _pt = _p.get("type")
+                    if _pt == "thinking":
+                        chunk = _p.get("content", "")
+                        _thinking_buf += chunk
+                        if _status is None:
+                            _status = st.status("🧠 深度思考中...", expanded=True)
+                            _thinking_ph = _status.empty()
+                        _thinking_ph.markdown(_thinking_buf + "▌")
+                    elif _pt == "text":
+                        if _status is not None and not _text_buf:
+                            # 首个 text chunk 到来时收起思考区域
+                            _thinking_ph.markdown(_thinking_buf)
+                            _status.update(
+                                label=f"🧠 思考完毕（{len(_thinking_buf)} 字符）",
+                                state="complete",
+                                expanded=False,
+                            )
+                        _text_buf += _p.get("content", "")
+                        _text_ph.markdown(_text_buf + "▌")
+                    elif _pt == "tool_start":
+                        _tool_info = _p.get("tool_info", [])
+                        _blocks = []
+                        for _ti in _tool_info:
+                            _name = _ti.get("name", "")
+                            _inp = _ti.get("input", {})
+                            if _name == "execute_terminal":
+                                _cmd = _inp.get("command", "")
+                                _wd = _inp.get("working_dir", "")
+                                _hdr = "🖥 **执行命令**" + (f"  `{_wd}`" if _wd else "")
+                                _blocks.append(f"{_hdr}\n```shell\n{_cmd}\n```")
+                            elif _name.startswith("mcp__"):
+                                _parts = _name.split("__", 2)
+                                _srv = _parts[1] if len(_parts) > 1 else ""
+                                _tool = _parts[2] if len(_parts) > 2 else _name
+                                _args = ", ".join(f"`{k}`={repr(v)}" for k, v in _inp.items()) if _inp else "无参数"
+                                _blocks.append(f"🔌 **MCP [{_srv}]** · `{_tool}`\n\n> {_args}")
+                            else:
+                                _blocks.append({"get_system_time": "🕐 获取系统时间"}.get(_name, f"🔧 {_name}"))
+                        _text_buf += "\n\n" + "\n\n".join(_blocks) + "\n\n"
+                        _text_ph.markdown(_text_buf)
+                    elif _pt == "tool_end":
+                        _results = _p.get("results", [])
+                        if _results:
+                            _text_buf += f"```\n{chr(10).join(str(r) for r in _results)}\n```\n\n"
+                            _text_ph.markdown(_text_buf)
+                    elif _pt == "compression":
+                        st.session_state["_compression_happened"] = True
+                    elif _pt == "error":
+                        _text_ph.markdown(_text_buf + f"\n\n❌ {_p.get('message', '未知错误')}")
+
+                _text_ph.markdown(_text_buf)
+                # 若模型只输出了思考但没有正文（罕见），关闭 status
+                if _status is not None and not _text_buf:
+                    _thinking_ph.markdown(_thinking_buf)
+                    _status.update(label="🧠 思考完毕", state="complete", expanded=False)
+                reply = _text_buf
+            else:
+                # ── 普通模式：沿用 st.write_stream ───────────────────────────
+                reply = st.write_stream(
+                    stream_chat(
+                        st.session_state.active_session_id,
+                        _effective_prompt,
+                        _effective_attachments,
+                        is_retry=_is_retry,
+                        search=_search_on,
+                    )
                 )
-            )
         if st.session_state.pop("_compression_happened", False):
             st.toast("✂️ 对话历史已自动压缩以节省上下文空间", icon="💡")
 

@@ -30,7 +30,13 @@ class RAGPipeline:
         self.db = db
         self.embed_svc = make_embedding_service(config)
 
-    async def ingest(self, filename: str, mime_type: str, text: str) -> KnowledgeDocument:
+    async def ingest(
+        self,
+        filename: str,
+        mime_type: str,
+        text: str,
+        namespace: str = "global",  # 创新点3预留：托管记忆层命名空间隔离，当前忽略
+    ) -> KnowledgeDocument:
         """将文档切片后嵌入并存入知识库，返回 KnowledgeDocument。"""
         chunks = _split_text(text)
         if not chunks:
@@ -59,7 +65,12 @@ class RAGPipeline:
         logger.info(f"已摄取文档 '{filename}'，共 {len(chunks)} 个切片")
         return doc
 
-    async def query(self, question: str, top_k: int = TOP_K) -> list[dict]:
+    async def query(
+        self,
+        question: str,
+        top_k: int = TOP_K,
+        namespace: str = "global",  # 创新点3预留：未来按命名空间过滤 KnowledgeDocument，当前忽略
+    ) -> list[dict]:
         """
         将问题嵌入后按余弦相似度检索最相关的切片。
         返回 list[{"filename": str, "content": str, "score": float}]。

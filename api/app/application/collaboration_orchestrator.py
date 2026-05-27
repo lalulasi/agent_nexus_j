@@ -34,6 +34,7 @@ from api.app.infrastructure.database.models import AgentSession, LLMConfig, Mess
 from api.app.infrastructure.llm.adapters import StreamTurn, make_adapter
 from api.app.infrastructure.tools.base import BaseTool
 from api.app.infrastructure.tools.http_tool import HttpTool
+from api.app.infrastructure.mcp.manager import get_mcp_manager
 from api.app.infrastructure.tools.registry import get_tool
 
 settings = get_settings()
@@ -142,6 +143,13 @@ class CollaborationOrchestrator:
         elif mode == "master_slave":
             async for ev in self._stream_master_slave(session, user_message, cfg):
                 yield ev
+        elif mode == "auto":
+            # 创新点2占位：智能路由 Agent 尚未实现，提示用户手动选择
+            # 未来由 routing_agent.py 的 RoutingAgent 分析 Query 自动决策
+            yield json.dumps({
+                "type": "error",
+                "message": "智能路由（auto 模式）尚未实现，请手动选择「圆桌」或「主从」模式。",
+            })
         else:
             yield json.dumps({"type": "error", "message": f"未知协作模式: {mode}"})
 
@@ -160,9 +168,11 @@ class CollaborationOrchestrator:
             yield json.dumps({"type": "error", "message": "圆桌模式至少需要 2 个模型槽位"})
             return
 
-        # 加载所有 LLMConfig
+        # 加载所有 LLMConfig（跳过 MCP 槽位）
         config_map: dict[str, LLMConfig] = {}
         for slot in models_cfg:
+            if slot.get("type", "llm") == "mcp":
+                continue
             cid = str(slot["config_id"])
             if cid not in config_map:
                 llm_cfg = await self.db.get(LLMConfig, uuid.UUID(cid))
@@ -202,17 +212,31 @@ class CollaborationOrchestrator:
 
             # 并行运行本轮所有面板模型
             async def _call_one(slot: dict, suffix: str) -> dict:
-                cid = str(slot["config_id"])
-                llm_cfg = config_map[cid]
                 role = slot["role"]
                 role_prompt = ROLE_PROMPTS.get(role, "")
-                system = (base_system + "\n\n" if base_system else "") + role_prompt
-
-                adapter = make_adapter(llm_cfg, [])
+                sys_prefix = (base_system + "\n\n" if base_system else "") + role_prompt
                 question = user_message + suffix
+
+                if slot.get("type", "llm") == "mcp":
+                    server_name = slot["server_name"]
+                    display_name = slot.get("display_name", server_name)
+                    mcp_msgs = [{"role": "user", "content": (f"{sys_prefix}\n\n{question}" if sys_prefix else question)}]
+                    try:
+                        mcp_result = await get_mcp_manager().chat(server_name, mcp_msgs)
+                        text = mcp_result.content
+                        if mcp_result.is_error:
+                            text = f"[MCP错误] {text}"
+                    except Exception as exc:
+                        text = f"[调用失败: {exc}]"
+                        logger.warning(f"[圆桌] {role} (MCP:{server_name}) 调用失败: {exc}")
+                    return {"role": role, "model_name": display_name, "text": text}
+
+                cid = str(slot["config_id"])
+                llm_cfg = config_map[cid]
+                adapter = make_adapter(llm_cfg, [])
                 messages = adapter.format_history([{"role": "user", "content": question}])
                 try:
-                    turn = await adapter.complete(messages, system, settings.agent_max_tokens)
+                    turn = await adapter.complete(messages, sys_prefix or None, settings.agent_max_tokens)
                     text = turn.text
                 except Exception as exc:
                     text = f"[调用失败: {exc}]"
@@ -234,11 +258,6 @@ class CollaborationOrchestrator:
                 })
 
         # ── 综合阶段 ──────────────────────────────────────────────────────────
-        synth_cfg = config_map[str(synthesizer_slot["config_id"])]
-        yield json.dumps({
-            "type": "collab_synthesis_start",
-            "model_name": synth_cfg.display_name,
-        })
 
         # 构建综合者的完整输入
         summary_parts = [f"**用户问题：**\n{user_message}\n"]
@@ -250,8 +269,38 @@ class CollaborationOrchestrator:
                 label = ROLE_LABELS.get(entry["role"], entry["role"])
                 summary_parts.append(f"【{label} · {entry['model_name']}】\n{entry['text']}")
         synthesis_input = "\n\n".join(summary_parts)
-
         synth_system = (base_system + "\n\n" if base_system else "") + ROLE_PROMPTS["synthesizer"]
+
+        if synthesizer_slot.get("type", "llm") == "mcp":
+            synth_name = synthesizer_slot["server_name"]
+            synth_display = synthesizer_slot.get("display_name", synth_name)
+            yield json.dumps({"type": "collab_synthesis_start", "model_name": synth_display})
+            mcp_msgs = [{"role": "user", "content": (f"{synth_system}\n\n{synthesis_input}" if synth_system else synthesis_input)}]
+            final_text = ""
+            try:
+                mcp_result = await get_mcp_manager().chat(synth_name, mcp_msgs)
+                final_text = mcp_result.content
+                if mcp_result.is_error:
+                    final_text = f"[MCP错误] {final_text}"
+            except Exception as exc:
+                logger.exception("[圆桌] MCP综合者调用失败")
+                yield json.dumps({"type": "error", "message": str(exc)})
+                return
+            chunk_size = 60
+            for i in range(0, len(final_text), chunk_size):
+                yield json.dumps({"type": "text", "content": final_text[i:i + chunk_size]})
+            await self._save_message(session.id, "assistant", final_text)
+            llm_slot = next((s for s in panel_slots if s.get("type", "llm") != "mcp"), None)
+            if llm_slot:
+                await self._auto_title(session, user_message, make_adapter(config_map[str(llm_slot["config_id"])], []))
+            yield json.dumps({"type": "done", "usage": {}})
+            return
+
+        synth_cfg = config_map[str(synthesizer_slot["config_id"])]
+        yield json.dumps({
+            "type": "collab_synthesis_start",
+            "model_name": synth_cfg.display_name,
+        })
         synth_adapter = make_adapter(synth_cfg, [])
         synth_messages = synth_adapter.format_history([
             {"role": "user", "content": synthesis_input}
@@ -295,11 +344,18 @@ class CollaborationOrchestrator:
             yield json.dumps({"type": "error", "message": "主模型配置不存在"})
             return
 
-        reviewer_cfgs: list[LLMConfig] = []
-        for cid in reviewer_cids:
-            rc = await self.db.get(LLMConfig, uuid.UUID(str(cid)))
-            if rc:
-                reviewer_cfgs.append(rc)
+        # reviewer_slots 优先；向后兼容 reviewer_config_ids（仅 LLM）
+        reviewer_slots_raw: list[dict] = cfg.get("reviewer_slots") or [
+            {"type": "llm", "config_id": str(cid)} for cid in reviewer_cids
+        ]
+        reviewer_config_cache: dict[str, LLMConfig] = {}
+        for _slot in reviewer_slots_raw:
+            if _slot.get("type", "llm") != "mcp":
+                _cid = str(_slot["config_id"])
+                if _cid not in reviewer_config_cache:
+                    _rc = await self.db.get(LLMConfig, uuid.UUID(_cid))
+                    if _rc:
+                        reviewer_config_cache[_cid] = _rc
 
         base_system = session.system_prompt_ref.content if session.system_prompt_ref else None
 
@@ -342,7 +398,7 @@ class CollaborationOrchestrator:
 
         yield json.dumps({"type": "collab_model_end", "role": "master", "usage": master_usage})
 
-        if not reviewer_cfgs:
+        if not reviewer_slots_raw:
             # 无评委，主模型答案即最终答案
             await self._save_message(session.id, "assistant", master_text, token_count=master_usage.get("output_tokens"))
             await self._auto_title(session, user_message, master_adapter)
@@ -353,7 +409,7 @@ class CollaborationOrchestrator:
         yield json.dumps({
             "type": "collab_phase",
             "phase": "review",
-            "label": f"评委评审中（{len(reviewer_cfgs)} 位）",
+            "label": f"评委评审中（{len(reviewer_slots_raw)} 位）",
         })
 
         review_prompt = (
@@ -362,35 +418,59 @@ class CollaborationOrchestrator:
             f"{_REVIEWER_INSTRUCTION}"
         )
 
-        async def _review_one(rc: LLMConfig) -> dict:
+        async def _review_one(slot: dict) -> dict:
+            slot_type = slot.get("type", "llm")
             raw_text = ""
-            try:
-                adapter = make_adapter(rc, [])
-                msgs = adapter.format_history([{"role": "user", "content": review_prompt}])
-                turn = await adapter.complete(msgs, None, 1500)
-                raw_text = turn.text.strip()
-                # 提取 JSON：去掉 markdown 围栏，再用正则定位 {} 块
-                cleaned = re.sub(r"```(?:json)?\s*", "", raw_text).strip()
-                m = re.search(r"\{[\s\S]*\}", cleaned)
-                raw_json = m.group() if m else cleaned
-                data = json.loads(raw_json)
-            except json.JSONDecodeError:
-                data = {"scores": {}, "critique": raw_text[:400], "improved_answer": master_text}
-            except Exception as exc:
-                logger.warning(f"[主从] 评委 {rc.display_name} 调用失败: {exc}")
-                data = {"scores": {}, "critique": f"评审失败: {exc}", "improved_answer": master_text}
+            if slot_type == "mcp":
+                server_name = slot["server_name"]
+                display_name = slot.get("display_name", server_name)
+                try:
+                    mcp_result = await get_mcp_manager().chat(
+                        server_name, [{"role": "user", "content": review_prompt}]
+                    )
+                    raw_text = mcp_result.content
+                    if mcp_result.is_error:
+                        raise RuntimeError(raw_text)
+                    cleaned = re.sub(r"```(?:json)?\s*", "", raw_text).strip()
+                    m = re.search(r"\{[\s\S]*\}", cleaned)
+                    data = json.loads(m.group() if m else cleaned)
+                except json.JSONDecodeError:
+                    data = {"scores": {}, "critique": raw_text[:400], "improved_answer": master_text}
+                except Exception as exc:
+                    logger.warning(f"[主从] MCP评委 {server_name} 调用失败: {exc}")
+                    data = {"scores": {}, "critique": f"评审失败: {exc}", "improved_answer": master_text}
+            else:
+                cid = str(slot["config_id"])
+                rc = reviewer_config_cache.get(cid)
+                display_name = rc.display_name if rc else cid
+                try:
+                    if rc is None:
+                        raise RuntimeError(f"评委配置不存在: {cid}")
+                    adapter = make_adapter(rc, [])
+                    msgs = adapter.format_history([{"role": "user", "content": review_prompt}])
+                    turn = await adapter.complete(msgs, None, 1500)
+                    raw_text = turn.text.strip()
+                    # 提取 JSON：去掉 markdown 围栏，再用正则定位 {} 块
+                    cleaned = re.sub(r"```(?:json)?\s*", "", raw_text).strip()
+                    m = re.search(r"\{[\s\S]*\}", cleaned)
+                    data = json.loads(m.group() if m else cleaned)
+                except json.JSONDecodeError:
+                    data = {"scores": {}, "critique": raw_text[:400], "improved_answer": master_text}
+                except Exception as exc:
+                    logger.warning(f"[主从] 评委 {display_name} 调用失败: {exc}")
+                    data = {"scores": {}, "critique": f"评审失败: {exc}", "improved_answer": master_text}
 
             scores = data.get("scores", {})
             weighted = _weighted_score(scores)
             return {
-                "model_name": rc.display_name,
+                "model_name": display_name,
                 "scores": scores,
                 "weighted_total": round(weighted, 1),
                 "critique": data.get("critique", ""),
                 "improved_answer": data.get("improved_answer", master_text),
             }
 
-        reviewer_results: list[dict] = await asyncio.gather(*[_review_one(rc) for rc in reviewer_cfgs])
+        reviewer_results: list[dict] = await asyncio.gather(*[_review_one(s) for s in reviewer_slots_raw])
 
         for res in reviewer_results:
             yield json.dumps({"type": "collab_reviewer_result", **res})

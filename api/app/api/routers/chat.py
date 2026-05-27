@@ -89,6 +89,8 @@ async def chat_stream(payload: ChatRequest, db: DB):
             async for chunk in orchestrator.stream_run(
                 session, payload.message, config, processed_attachments,
                 is_retry=payload.is_retry,
+                thinking=payload.thinking,
+                search=payload.search,
             ):
                 yield f"data: {chunk}\n\n"
         except Exception as e:

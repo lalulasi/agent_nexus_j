@@ -33,6 +33,8 @@ dependencies = [
     "pgvector>=0.3.0",
     # Local embedding model (ONNX-based, no PyTorch required)
     "fastembed>=0.4.0",
+    # Search tools
+    "duckduckgo-search>=6.0.0",
 ]
 
 [project.optional-dependencies]
