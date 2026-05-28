@@ -1,2 +1,2 @@
-# AgentNexus-J 启动脚本（Windows PowerShell 入口）
+# AgentNexus-J startup script (PowerShell entry point -> delegates to start.bat)
 & "$PSScriptRoot\start.bat"
