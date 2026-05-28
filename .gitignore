@@ -50,3 +50,6 @@ api/migrations/versions/*.pyc
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Runtime
+.backend.pid
