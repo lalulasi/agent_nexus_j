@@ -1353,6 +1353,9 @@ for i, msg in enumerate(_history):
                 st.image(_img_bytes, caption=_att.get("filename", ""), width=320)
             else:
                 st.caption(f"📄 {_att.get('filename', '文件')}")
+        if msg.get("thinking"):
+            with st.expander(f"🧠 思考完毕（{len(msg['thinking'])} 字符）", expanded=False):
+                st.markdown(msg["thinking"])
         st.markdown(msg["content"])
 
     # ── 最后一条 assistant 消息下方：重试 / 复制按钮 ──────────────────────────
@@ -1567,6 +1570,7 @@ if _effective_prompt:
             reply = final_text
     else:
         st.session_state["_compression_happened"] = False
+        _saved_thinking = ""
         with st.chat_message("assistant"):
             if _thinking_on:
                 # ── Thinking 模式：手动 loop + st.status 展示思考过程 ─────────
@@ -1639,6 +1643,7 @@ if _effective_prompt:
                 if _status is not None and not _text_buf:
                     _thinking_ph.markdown(_thinking_buf)
                     _status.update(label="🧠 思考完毕", state="complete", expanded=False)
+                _saved_thinking = _thinking_buf
                 reply = _text_buf
             else:
                 # ── 普通模式：沿用 st.write_stream ───────────────────────────
@@ -1655,5 +1660,8 @@ if _effective_prompt:
             st.toast("✂️ 对话历史已自动压缩以节省上下文空间", icon="💡")
 
     if reply:
-        st.session_state.chat_history.append({"role": "assistant", "content": reply})
+        entry: dict = {"role": "assistant", "content": reply}
+        if _saved_thinking:
+            entry["thinking"] = _saved_thinking
+        st.session_state.chat_history.append(entry)
     st.rerun()

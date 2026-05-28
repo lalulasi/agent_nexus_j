@@ -5,10 +5,7 @@
 1. [环境要求](#1-环境要求)
 2. [安装依赖](#2-安装依赖)
 3. [配置环境变量](#3-配置环境变量)
-4. [启动数据库](#4-启动数据库)
-5. [数据库迁移](#5-数据库迁移)
-6. [启动后端服务](#6-启动后端服务)
-7. [启动前端控制台](#7-启动前端控制台)
+4. [启动系统](#4-启动系统) — 一键启动 · 手动分步
 8. [首次使用：配置模型](#8-首次使用配置模型)
 9. [普通对话](#9-普通对话)（含深度思考 · 网络搜索）
 10. [RAG 知识库](#10-rag-知识库)
@@ -29,8 +26,20 @@
 | 工具 | 版本要求 | 安装方式 |
 |------|---------|---------|
 | Python | 3.12+ | [python.org](https://www.python.org/downloads/) |
-| uv | 最新版 | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
+| uv | 最新版 | 见下方说明 |
 | Docker Desktop | 最新版 | [docker.com](https://www.docker.com/products/docker-desktop/) |
+
+**安装 uv**
+
+macOS / Linux：
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+Windows（PowerShell）：
+```powershell
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
 
 验证安装：
 
@@ -44,8 +53,15 @@ docker --version    # Docker version xx.x.x
 
 ## 2. 安装依赖
 
+macOS / Linux：
 ```bash
 cd /path/to/agent_nexus_j
+uv sync
+```
+
+Windows（PowerShell）：
+```powershell
+cd C:\path\to\agent_nexus_j
 uv sync
 ```
 
@@ -57,9 +73,17 @@ uv sync
 
 ## 3. 配置环境变量
 
+macOS / Linux：
 ```bash
 cp .env.example .env
 ```
+
+Windows（PowerShell）：
+```powershell
+Copy-Item .env.example .env
+```
+
+> 使用一键启动脚本时会自动完成此步骤，无需手动执行。
 
 `.env` 关键字段：
 
@@ -78,72 +102,107 @@ ANTHROPIC_API_KEY=sk-ant-...
 
 ---
 
-## 4. 启动数据库
+## 4. 启动系统
+
+### 4.1 一键启动（推荐）
+
+**macOS / Linux**
+
+```bash
+chmod +x start.sh   # 仅需一次
+./start.sh
+```
+
+**Windows CMD**
+
+```cmd
+start.bat
+```
+
+**Windows PowerShell**
+
+```powershell
+.\start.ps1
+```
+
+> 若提示执行策略受限，先在 PowerShell 中运行：
+> ```powershell
+> Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+> ```
+
+两个脚本逻辑相同，自动完成以下步骤：
+
+1. 检查 Docker 和 uv 是否已安装并运行
+2. 若 `.env` 不存在，自动从 `.env.example` 复制
+3. 启动 PostgreSQL 容器，等待健康检查通过
+4. 执行数据库迁移（`alembic upgrade head`）
+5. 在后台启动 FastAPI 后端，日志写入 `logs/backend_stdout.log`
+6. 在前台启动 Streamlit 前端
+
+启动完成后：
+
+| 服务 | 地址 |
+|------|------|
+| 前端控制台 | http://localhost:8501 |
+| 后端 API | http://localhost:8000 |
+| API 文档（开发模式） | http://localhost:8000/docs |
+
+按 **Ctrl+C** 退出：前端和后端同时停止，数据库保持运行（数据不丢失）。再次启动直接重新运行脚本即可。
+
+> **首次启动**时后端会自动下载本地嵌入模型（约 90 MB），脚本最多等待 2 分钟，请保持网络畅通。
+
+### 4.2 手动启动（分步）
+
+如需单独控制各组件（以下命令在 macOS / Linux / Windows 均相同，除非特别注明）：
+
+**启动数据库**
 
 项目使用 **pgvector/pgvector:pg16** 镜像，内含 pgvector 向量扩展（RAG 功能依赖）。
 
 ```bash
 docker compose up -d
+docker compose ps   # 看到 (healthy) 即成功
 ```
 
-验证：
-
-```bash
-docker compose ps
-# 看到 agent_nexus_postgres   running (healthy) 即成功
-```
-
----
-
-## 5. 数据库迁移
-
-**首次启动前必须执行，之后每次拉取新代码后若有新迁移文件也需执行。**
+**数据库迁移**（首次或拉取新代码后执行，现有数据不会丢失）
 
 ```bash
 uv run alembic -c api/alembic.ini upgrade head
 ```
 
-成功输出示例：
-
-```
-INFO  [alembic.runtime.migration] Running upgrade ...
-```
-
-> 不再需要手动 DROP/CREATE schema。迁移脚本会自动处理表结构变更，**现有数据不会丢失**。
-
----
-
-## 6. 启动后端服务
+**启动后端**
 
 ```bash
 uv run python main.py
 ```
 
-启动成功输出：
-
-```
-INFO  | Starting AgentNexus-J [development]
-INFO  | Database tables initialized
-INFO  | 内置工具同步完成
-INFO  | 本地嵌入模型已就绪: BAAI/bge-small-zh-v1.5
-INFO  | Uvicorn running on http://0.0.0.0:8000
-```
-
-> **首次启动**时会自动下载本地嵌入模型（约 90 MB），请保持网络畅通，之后离线可用。
-
 API 文档（开发模式）：http://localhost:8000/docs
 
----
-
-## 7. 启动前端控制台
-
-新开一个终端窗口：
+**启动前端**（新开终端窗口）
 
 ```bash
 uv run streamlit run app.py
 ```
 
 访问：http://localhost:8501
+
+**停止所有服务**
+
+macOS / Linux：
+```bash
+# Streamlit / FastAPI：Ctrl+C
+# 停止数据库（可选）：
+docker compose down
+```
+
+Windows（PowerShell）：
+```powershell
+# Streamlit / FastAPI：Ctrl+C
+# 手动终止后端进程（如有残留）：
+taskkill /IM python.exe /F
+# 停止数据库（可选）：
+docker compose down
+```
 
 ---
 
@@ -645,7 +704,8 @@ uv run python main.py
 
 - 确认 MCP Server 正在运行，地址填写正确
 - 检查对外请求日志 `logs/outbound_*.log`，查看 MCP 握手请求的具体错误
-- 尝试手动验证：`curl http://<server>/health`
+- 手动验证（macOS/Linux）：`curl http://<server>/health`
+- 手动验证（Windows PowerShell）：`Invoke-WebRequest http://<server>/health -UseBasicParsing`
 
 ### MCP Server 注册了但工具没有出现
 
@@ -655,9 +715,16 @@ uv run python main.py
 
 ### 无法连接后台服务
 
+macOS / Linux：
 ```bash
 curl http://localhost:8000/health
 # 预期：{"status":"ok","env":"development"}
+```
+
+Windows（PowerShell）：
+```powershell
+Invoke-WebRequest -Uri http://localhost:8000/health -UseBasicParsing
+# 预期：StatusCode 200，Content 含 "status":"ok"
 ```
 
 ### 数据库连接失败
@@ -673,6 +740,9 @@ docker compose up -d    # 如未运行则启动
 
 ```
 agent_nexus_j/
+├── start.sh                     # 一键启动脚本 — macOS / Linux
+├── start.ps1                    # 一键启动脚本 — Windows PowerShell
+├── start.bat                    # 一键启动脚本 — Windows CMD（调用 start.ps1）
 ├── main.py                      # 后端启动入口
 ├── app.py                       # Streamlit 前端控制台
 ├── mock_mcp_server.py           # 本地测试用 MCP Server（echo / get_time / calculator / chat）
