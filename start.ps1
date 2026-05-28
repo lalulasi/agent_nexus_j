@@ -37,7 +37,7 @@ try {
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
         fail "docker not found. Install Docker Desktop: https://www.docker.com/products/docker-desktop"
     }
-    docker info 2>&1 | Out-Null
+    cmd /c "docker info >nul 2>&1"
     if ($LASTEXITCODE -ne 0) { fail "Docker is not running. Please start Docker Desktop." }
     if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
         fail "uv not found. Install: powershell -c `"irm https://astral.sh/uv/install.ps1 | iex`""
@@ -59,7 +59,7 @@ try {
     $waited = 0
     while ($true) {
         Start-Sleep 2; $waited += 2
-        if ((docker compose ps 2>$null | Out-String) -match '\(healthy\)') {
+        if ((cmd /c "docker compose ps 2>nul") -match '\(healthy\)') {
             Write-Host " ready"; break
         }
         Write-Host "." -NoNewline
@@ -86,6 +86,9 @@ try {
         Remove-Item $PidFile -Force
     }
 
+    # Prevent huggingface_hub from attempting symlinks (WinError 1314 without Developer Mode)
+    $env:HF_HUB_DISABLE_SYMLINKS_WARNING = "1"
+
     $proc = Start-Process uv `
         -ArgumentList "run", "python", "main.py" `
         -WorkingDirectory $ScriptDir `
@@ -95,11 +98,14 @@ try {
     $proc.Id | Set-Content $PidFile -NoNewline
 
     Write-Host "  Waiting for backend (first run downloads ~90MB model, up to 2 min)..." -NoNewline
+    # Use a proxy-less session so corporate proxy settings don't block localhost
+    $_noProxy = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+    $_noProxy.Proxy = New-Object System.Net.WebProxy
     $waited = 0
     while ($true) {
         Start-Sleep 2; $waited += 2
         try {
-            Invoke-WebRequest -Uri "http://localhost:8000/health" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop | Out-Null
+            Invoke-WebRequest -Uri "http://127.0.0.1:8000/health" -WebSession $_noProxy -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop | Out-Null
             Write-Host " ready"; break
         } catch {}
         Write-Host "." -NoNewline
