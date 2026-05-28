@@ -36,26 +36,33 @@ def _handle_corrupt_cache(e: Exception, model_name: str, TextEmbedding):
     from pathlib import Path
 
     err = str(e)
-    is_corrupt = "tokenizer.json" in err or "could not find" in err.lower()
+    # 实际报错含 "tokenizer_config.json" 或 "tokenizer.json"，统一用 "tokenizer" 匹配
+    is_corrupt = "tokenizer" in err.lower() and "could not find" in err.lower()
     if not is_corrupt:
         raise e
 
-    # fastembed 错误信息格式: "could not find tokenizer.json in <path>"
-    # 直接从错误信息中解析缓存目录并删除
-    match = re.search(r'\bin\s+(.+?)\s*$', err.strip())
+    # fastembed 错误格式: "Could not find tokenizer_config.json in <path>"
+    # 路径指向 snapshots/{hash} 子目录，需向上找到 models-- 根目录整体删除
+    match = re.search(r'\bin\s+(.+)', err.strip())
     if match:
-        bad_dir = Path(match.group(1).strip())
-        if bad_dir.exists() and "models--" in bad_dir.name:
-            logger.warning(f"检测到损坏的模型缓存，正在清理: {bad_dir}")
-            shutil.rmtree(bad_dir, ignore_errors=True)
+        bad_path = Path(match.group(1).strip())
+        # 向上遍历，找到以 models-- 开头的目录作为删除目标
+        model_dir = bad_path
+        for candidate in [bad_path, *bad_path.parents]:
+            if candidate.name.startswith("models--"):
+                model_dir = candidate
+                break
+        if model_dir.exists():
+            logger.warning(f"检测到损坏的模型缓存，正在清理: {model_dir}")
+            shutil.rmtree(model_dir, ignore_errors=True)
             logger.info("缓存已清理，重新下载模型...")
             return TextEmbedding(model_name=model_name)
 
-    # 解析路径失败时，给出人工清理指引
-    cache_hint = Path.home() / ".cache" / "fastembed"
+    # 无法自动清理时，给出人工指引
     raise RuntimeError(
         f"模型缓存损坏且无法自动清理，请手动删除以下目录后重启：\n"
-        f"  {cache_hint}\n"
+        f"  Linux/macOS: ~/.cache/fastembed\n"
+        f"  Windows:     %LOCALAPPDATA%\\Temp\\fastembed_cache\n"
         f"原始错误：{err}"
     ) from e
 
