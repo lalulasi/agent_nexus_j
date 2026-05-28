@@ -741,8 +741,8 @@ docker compose up -d    # 如未运行则启动
 ```
 agent_nexus_j/
 ├── start.sh                     # 一键启动脚本 — macOS / Linux
-├── start.ps1                    # 一键启动脚本 — Windows PowerShell
-├── start.bat                    # 一键启动脚本 — Windows CMD（调用 start.ps1）
+├── start.bat                    # 一键启动脚本 — Windows（主脚本，CMD / 双击均可）
+├── start.ps1                    # 一键启动脚本 — Windows PowerShell 入口（调用 start.bat）
 ├── main.py                      # 后端启动入口
 ├── app.py                       # Streamlit 前端控制台
 ├── mock_mcp_server.py           # 本地测试用 MCP Server（echo / get_time / calculator / chat）
