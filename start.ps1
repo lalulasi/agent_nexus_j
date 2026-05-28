@@ -1,6 +1,6 @@
 # AgentNexus-J 一键启动脚本 (Windows)
 $ErrorActionPreference = "Stop"
-$ScriptDir = $PSScriptRoot
+$ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $LogDir    = "$ScriptDir\logs"
 $LogFile   = "$LogDir\backend_stdout.log"
 $ErrFile   = "$LogDir\backend_stderr.log"
@@ -16,9 +16,11 @@ function cleanup {
     warn "Shutting down..."
     if (Test-Path $PidFile) {
         $p = (Get-Content $PidFile -Raw).Trim()
-        & taskkill /PID $p /T /F 2>$null | Out-Null
+        if (Get-Process -Id ([int]$p) -ErrorAction SilentlyContinue) {
+            & taskkill /PID $p /T /F 2>$null | Out-Null
+            ok "Backend stopped"
+        }
         Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
-        ok "Backend stopped"
     }
     warn "Database still running. To stop: docker compose down"
 }
@@ -77,9 +79,11 @@ try {
 
     if (Test-Path $PidFile) {
         $oldPid = (Get-Content $PidFile -Raw).Trim()
-        & taskkill /PID $oldPid /T /F 2>$null | Out-Null
+        if (Get-Process -Id ([int]$oldPid) -ErrorAction SilentlyContinue) {
+            & taskkill /PID $oldPid /T /F 2>$null | Out-Null
+            Start-Sleep 1
+        }
         Remove-Item $PidFile -Force
-        Start-Sleep 1
     }
 
     $proc = Start-Process uv `
