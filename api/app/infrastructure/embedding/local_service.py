@@ -23,7 +23,41 @@ def _load_model(model_name: str):
             f"  • sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2（220 MB）"
         )
     logger.info(f"加载本地嵌入模型: {model_name}（首次使用时自动下载）")
-    return TextEmbedding(model_name=model_name)
+    try:
+        return TextEmbedding(model_name=model_name)
+    except Exception as e:
+        return _handle_corrupt_cache(e, model_name, TextEmbedding)
+
+
+def _handle_corrupt_cache(e: Exception, model_name: str, TextEmbedding):
+    """检测损坏的模型缓存，自动清理后重试下载。"""
+    import re
+    import shutil
+    from pathlib import Path
+
+    err = str(e)
+    is_corrupt = "tokenizer.json" in err or "could not find" in err.lower()
+    if not is_corrupt:
+        raise e
+
+    # fastembed 错误信息格式: "could not find tokenizer.json in <path>"
+    # 直接从错误信息中解析缓存目录并删除
+    match = re.search(r'\bin\s+(.+?)\s*$', err.strip())
+    if match:
+        bad_dir = Path(match.group(1).strip())
+        if bad_dir.exists() and "models--" in bad_dir.name:
+            logger.warning(f"检测到损坏的模型缓存，正在清理: {bad_dir}")
+            shutil.rmtree(bad_dir, ignore_errors=True)
+            logger.info("缓存已清理，重新下载模型...")
+            return TextEmbedding(model_name=model_name)
+
+    # 解析路径失败时，给出人工清理指引
+    cache_hint = Path.home() / ".cache" / "fastembed"
+    raise RuntimeError(
+        f"模型缓存损坏且无法自动清理，请手动删除以下目录后重启：\n"
+        f"  {cache_hint}\n"
+        f"原始错误：{err}"
+    ) from e
 
 
 class LocalEmbeddingService:
