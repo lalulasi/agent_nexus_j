@@ -49,22 +49,12 @@ if errorlevel 1 (
     exit /b 1
 )
 
-set /a WAITED=0
-echo   Waiting for database to be ready...
-:WAIT_DB
-docker compose ps 2>nul | findstr /c:"(healthy)" >nul
-if not errorlevel 1 goto DB_READY
-if !WAITED! geq 30 (
-    echo.
-    echo   [ERROR] Database startup timed out (30s). Check: docker compose logs
+:: Wait inside a single PowerShell process (avoids repeated-spawn Ctrl+C issues)
+powershell -NoProfile -Command "$w=0; Write-Host -NoNewline '  Waiting for database'; while ($w -lt 30) { $o = docker compose ps 2>$null | Out-String; if ($o -match '\(healthy\)') { Write-Host ' ready'; exit 0 }; Write-Host -NoNewline '.'; Start-Sleep -Seconds 2; $w+=2 }; Write-Host ' timed out'; exit 1"
+if errorlevel 1 (
+    echo   [ERROR] Database startup timed out ^(30s^). Check: docker compose logs
     exit /b 1
 )
-<nul set /p TEMP_DOT=.
-timeout /t 2 /nobreak >nul
-set /a WAITED+=2
-goto WAIT_DB
-:DB_READY
-echo.
 echo   [OK] Database is ready
 
 :: ── 4. Run database migrations ─────────────────────────────────
@@ -88,35 +78,24 @@ if exist "%PID_FILE%" (
         taskkill /PID %%p /T /F >nul 2>&1
     )
     del "%PID_FILE%" >nul 2>&1
-    timeout /t 1 /nobreak >nul
+    powershell -NoProfile -Command "Start-Sleep -Seconds 1"
 )
 
 :: Start backend in background, capture PID via PowerShell
-powershell -NoProfile -Command ^
-    "$p = Start-Process cmd -ArgumentList '/c','uv run python main.py >> \"%LOG_FILE%\" 2>&1' -PassThru -NoNewWindow; $p.Id" ^
-    > "%PID_FILE%"
+powershell -NoProfile -Command "$p = Start-Process cmd -ArgumentList '/c','uv run python main.py >> \"%LOG_FILE%\" 2>&1' -PassThru -NoNewWindow; $p.Id" > "%PID_FILE%"
 for /f "usebackq" %%p in ("%PID_FILE%") do set BACKEND_PID=%%p
 echo   [INFO] Backend PID=%BACKEND_PID%, log: %LOG_FILE%
 
+:: Wait inside a single PowerShell process, streaming new log lines as they appear
 echo   Waiting for backend (first run downloads ~90MB model, up to 2 min)...
-echo   Streaming log output below:
 echo   -------------------------------------------------------
-set /a WAITED=0
-:WAIT_BACKEND
-curl -sf http://localhost:8000/health >nul 2>&1
-if not errorlevel 1 goto BACKEND_READY
-if !WAITED! geq 120 (
-    echo   -------------------------------------------------------
+set "PS_LOG=%LOG_FILE%"
+powershell -NoProfile -Command "$w=0; $n=0; while ($w -lt 120) { Start-Sleep -Seconds 2; $w+=2; try { $null = Invoke-WebRequest -Uri 'http://localhost:8000/health' -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop; exit 0 } catch {}; if (Test-Path $env:PS_LOG) { $lines = Get-Content $env:PS_LOG; if ($lines -and $lines.Count -gt $n) { foreach ($l in $lines[$n..($lines.Count-1)]) { Write-Host ('  ' + $l) }; $n = $lines.Count } } }; exit 1"
+echo   -------------------------------------------------------
+if errorlevel 1 (
     echo   [ERROR] Backend startup timed out. Check log: %LOG_FILE%
     goto CLEANUP
 )
-timeout /t 2 /nobreak >nul
-set /a WAITED+=2
-powershell -NoProfile -Command ^
-    "if (Test-Path '%LOG_FILE%') { $l = Get-Content '%LOG_FILE%' -Tail 1; if ($l) { Write-Host '  ' $l } }"
-goto WAIT_BACKEND
-:BACKEND_READY
-echo   -------------------------------------------------------
 echo   [OK] Backend is ready
 
 :: ── 6. Start frontend ──────────────────────────────────────────
