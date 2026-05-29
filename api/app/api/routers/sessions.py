@@ -70,6 +70,8 @@ async def update_session(session_id: uuid.UUID, payload: SessionUpdate, db: DB):
         session.system_prompt_id = None
     elif payload.system_prompt_id is not None:
         session.system_prompt_id = payload.system_prompt_id
+    if payload.collab_config is not None:
+        session.collab_config = payload.collab_config
 
     await db.flush()
     await db.refresh(session)

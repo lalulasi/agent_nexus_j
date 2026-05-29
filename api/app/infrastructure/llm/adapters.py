@@ -7,15 +7,18 @@ LLM 适配层：统一 Anthropic 和 OpenAI 兼容接口。
 """
 from __future__ import annotations
 
+import base64
 import json
 import time
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from typing import Union
+from urllib.parse import parse_qs, urlparse
 
 import anthropic
-from openai import AsyncOpenAI
+import httpx
+from openai import AsyncAzureOpenAI, AsyncOpenAI
 
 from api.app.core.logger import outbound_logger
 from api.app.infrastructure.database.models import LLMConfig
@@ -292,12 +295,91 @@ class AnthropicAdapter(BaseLLMAdapter):
         ]
 
 
+# ── 模型类型检测 ──────────────────────────────────────────────────────────────
+
+_IMAGE_MODEL_KEYWORDS = ("dall-e", "gpt-image", "image-generation")
+
+# 仅在模型名开头为 o+数字时识别为 o-series（排除 gpt-4o 等）
+def _is_image_model(model_name: str) -> bool:
+    name = model_name.lower()
+    return any(kw in name for kw in _IMAGE_MODEL_KEYWORDS)
+
+def _is_reasoning_model(model_name: str) -> bool:
+    """o1 / o3 / o4 系列：需要 max_completion_tokens。"""
+    name = model_name.lower()
+    return len(name) >= 2 and name[0] == "o" and name[1].isdigit()
+
+def _no_system_role(model_name: str) -> bool:
+    """o1-mini / o1-preview 不接受 system 角色。"""
+    name = model_name.lower()
+    return name.startswith(("o1-mini", "o1-preview"))
+
+def _no_tools_support(model_name: str) -> bool:
+    """o1-mini / o1-preview 不支持 function calling。"""
+    name = model_name.lower()
+    return name.startswith(("o1-mini", "o1-preview"))
+
+def _no_streaming(model_name: str) -> bool:
+    """o1-preview 不支持流式输出。"""
+    return model_name.lower().startswith("o1-preview")
+
+# 不能用于文本对话的模型类型，给出明确错误而非 404
+_UNSUPPORTED_PREFIXES = (
+    "tts-", "whisper-",
+    "text-embedding-", "text-similarity-", "text-search-",
+    "omni-moderation-", "text-moderation-",
+)
+
+def _is_azure_endpoint(url: str) -> bool:
+    return ".openai.azure.com" in url or ".azure.com" in url
+
+def _parse_azure_endpoint(url: str) -> tuple[str, str]:
+    """从 Azure URL 中提取 (endpoint, api_version)。
+
+    用户可能填完整路径（含 deployment 和 api-version），也可能只填 endpoint。
+    始终返回纯 endpoint（scheme+host）和 api-version。
+    """
+    parsed = urlparse(url)
+    endpoint = f"{parsed.scheme}://{parsed.netloc}"
+    qs = parse_qs(parsed.query)
+    api_version = qs.get("api-version", ["2024-12-01-preview"])[0]
+    return endpoint, api_version
+
+
+def _unsupported_model_type(model_name: str) -> str | None:
+    """返回不兼容原因字符串，兼容则返回 None。"""
+    name = model_name.lower()
+    if any(name.startswith(p) for p in ("tts-",)):
+        return "TTS 语音合成模型，不支持文本对话"
+    if name.startswith("whisper-"):
+        return "Whisper 语音转文字模型，不支持文本对话"
+    if any(name.startswith(p) for p in ("text-embedding-", "text-similarity-", "text-search-")):
+        return "Embedding 向量模型，不支持文本对话"
+    if any(name.startswith(p) for p in ("omni-moderation-", "text-moderation-")):
+        return "内容审核模型，不支持文本对话"
+    return None
+
+
 # ── OpenAI 兼容适配器 ─────────────────────────────────────────────────────────
 
 class OpenAIAdapter(BaseLLMAdapter):
     def __init__(self, config: LLMConfig, anthropic_tools: list[dict]) -> None:
         super().__init__(config, anthropic_tools)
-        self.client = AsyncOpenAI(api_key=config.api_key, base_url=config.base_url)
+        if _is_azure_endpoint(config.base_url or ""):
+            endpoint, api_version = _parse_azure_endpoint(config.base_url)
+            self.client = AsyncAzureOpenAI(
+                api_key=config.api_key,
+                azure_endpoint=endpoint,
+                api_version=api_version,
+            )
+        else:
+            self.client = AsyncOpenAI(api_key=config.api_key, base_url=config.base_url)
+        self._image_model    = _is_image_model(config.model)
+        self._reasoning      = _is_reasoning_model(config.model)
+        self._no_system      = _no_system_role(config.model)
+        self._no_tools       = _no_tools_support(config.model)
+        self._no_stream      = _no_streaming(config.model)
+        self._unsupported    = _unsupported_model_type(config.model)
         # 转换工具格式
         self.openai_tools = [
             {
@@ -311,15 +393,101 @@ class OpenAIAdapter(BaseLLMAdapter):
             for t in anthropic_tools
         ]
 
+    def _extract_prompt(self, messages: list[dict]) -> str:
+        """从消息列表中提取最后一条用户消息作为图像生成 prompt。"""
+        for msg in reversed(messages):
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                return " ".join(
+                    p.get("text", "") for p in content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                )
+        return ""
+
+    async def _generate_image(self, messages: list[dict]) -> StreamTurn:
+        prompt = self._extract_prompt(messages)
+        _base = self.config.base_url or "openai"
+        outbound_logger.info(f"LLM ▶ IMAGE  provider={_base}  model={self.config.model}  prompt={prompt[:200]!r}")
+        _t0 = time.monotonic()
+
+        result = await self.client.images.generate(
+            model=self.config.model,
+            prompt=prompt,
+            n=1,
+            size="1024x1024",
+        )
+
+        _dur = time.monotonic() - _t0
+        outbound_logger.info(f"LLM ◀ IMAGE  provider={_base}  model={self.config.model}  duration={_dur:.2f}s")
+
+        item = result.data[0]
+        if getattr(item, "b64_json", None):
+            text = f"![生成图片](data:image/png;base64,{item.b64_json})"
+        elif getattr(item, "url", None):
+            # 下载图片转为 base64，避免临时 URL 过期后图片丢失
+            try:
+                async with httpx.AsyncClient(timeout=30) as hc:
+                    img_resp = await hc.get(item.url)
+                    img_resp.raise_for_status()
+                    mime = img_resp.headers.get("content-type", "image/png").split(";")[0]
+                    b64 = base64.b64encode(img_resp.content).decode()
+                    text = f"![生成图片](data:{mime};base64,{b64})"
+            except Exception:
+                # 下载失败时降级保留 URL
+                text = f"![生成图片]({item.url})"
+        else:
+            text = "图片生成完成，但未返回图片数据。"
+        return StreamTurn(text=text, stop_reason="end_turn", usage={})
+
+    def _build_messages(self, messages: list[dict], system: str) -> list[dict]:
+        """构造最终消息列表，处理不支持 system 角色的模型。"""
+        if not system:
+            return list(messages)
+        if self._no_system:
+            # 将 system 内容合并到第一条 user 消息，避免 400 错误
+            result = list(messages)
+            for i, msg in enumerate(result):
+                if msg.get("role") == "user":
+                    content = msg.get("content", "")
+                    if isinstance(content, str):
+                        result[i] = {"role": "user", "content": f"{system}\n\n{content}"}
+                    return result
+            # 没有 user 消息时插入一条
+            return [{"role": "user", "content": system}] + result
+        return [{"role": "system", "content": system}] + list(messages)
+
     async def stream(self, messages, system, max_tokens, thinking: bool = False):
-        full_messages = ([{"role": "system", "content": system}] if system else []) + messages
+        if self._unsupported:
+            raise ValueError(f"模型 '{self.config.model}' 是{self._unsupported}，无法在对话中使用。")
+
+        if self._image_model:
+            turn = await self._generate_image(messages)
+            yield turn.text
+            yield turn
+            return
+
+        # o1-preview 不支持流式，降级为 complete
+        if self._no_stream:
+            turn = await self.complete(messages, system, max_tokens)
+            yield turn.text
+            yield turn
+            return
+
+        full_messages = self._build_messages(messages, system)
         kwargs: dict = {
             "model": self.config.model,
             "messages": full_messages,
-            "max_tokens": max_tokens,
             "stream": True,
         }
-        if self.openai_tools:
+        # o-series 用 max_completion_tokens，其他用 max_tokens
+        if self._reasoning:
+            kwargs["max_completion_tokens"] = max_tokens
+        else:
+            kwargs["max_tokens"] = max_tokens
+
+        if self.openai_tools and not self._no_tools:
             kwargs["tools"] = self.openai_tools
 
         _base = self.config.base_url or "openai"
@@ -399,13 +567,23 @@ class OpenAIAdapter(BaseLLMAdapter):
         )
 
     async def complete(self, messages, system, max_tokens):
-        full_messages = ([{"role": "system", "content": system}] if system else []) + messages
+        if self._unsupported:
+            raise ValueError(f"模型 '{self.config.model}' 是{self._unsupported}，无法在对话中使用。")
+
+        if self._image_model:
+            return await self._generate_image(messages)
+
+        full_messages = self._build_messages(messages, system)
         kwargs: dict = {
             "model": self.config.model,
             "messages": full_messages,
-            "max_tokens": max_tokens,
         }
-        if self.openai_tools:
+        if self._reasoning:
+            kwargs["max_completion_tokens"] = max_tokens
+        else:
+            kwargs["max_tokens"] = max_tokens
+
+        if self.openai_tools and not self._no_tools:
             kwargs["tools"] = self.openai_tools
 
         _base = self.config.base_url or "openai"

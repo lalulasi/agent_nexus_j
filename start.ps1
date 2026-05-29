@@ -32,6 +32,13 @@ try {
     Write-Host "AgentNexus-J - Windows Startup" -ForegroundColor Cyan
     Write-Host "===============================" -ForegroundColor Cyan
 
+    # 0. --clean flag
+    if ($args -contains "--clean") {
+        step "Clearing database data (--clean)..."
+        docker compose down --volumes
+        ok "Data cleared"
+    }
+
     # 1. Prerequisites
     step "Checking prerequisites..."
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {

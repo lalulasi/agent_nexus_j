@@ -13,7 +13,7 @@ from api.app.core.config import get_settings
 from api.app.core.logger import logger
 from api.app.domain.schemas import ChatResponse, MessageOut
 from api.app.infrastructure.database.models import AgentSession, LLMConfig, Message, SearchConfig, UserTool
-from api.app.infrastructure.llm.adapters import StreamTurn, ThinkingChunk, make_adapter
+from api.app.infrastructure.llm.adapters import StreamTurn, ThinkingChunk, _is_image_model, make_adapter
 from api.app.infrastructure.tools.base import BaseTool
 from api.app.infrastructure.tools.http_tool import HttpTool
 from api.app.infrastructure.mcp.manager import get_mcp_manager
@@ -230,8 +230,8 @@ class AgentOrchestrator:
             session.id, "assistant", final_text,
             token_count=last_usage.get("output_tokens"),
         )
-        await self._auto_title(session, user_message, adapter)
         yield json.dumps({"type": "done", "usage": last_usage})
+        await self._auto_title(session, user_message, adapter)
 
     # ── 内部：非流式循环 ──────────────────────────────────────────────────────
 
@@ -273,6 +273,14 @@ class AgentOrchestrator:
         if session.title != "新会话":
             return
         try:
+            # 图像模型无法生成文本标题，直接用消息前缀
+            if _is_image_model(adapter.config.model):
+                title = user_message.strip()[:20]
+                if title:
+                    session.title = title
+                    await self.db.flush()
+                return
+
             # 使用无工具 adapter，避免模型对命名 prompt 发起工具调用
             naming_adapter = make_adapter(adapter.config, [])
             msgs = naming_adapter.format_history([{

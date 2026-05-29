@@ -2,6 +2,7 @@
 
 import base64
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -424,6 +425,47 @@ def _render_collab_process(process_events: list[dict]) -> None:
         _render_round_table_process(process_events)
 
 
+# ── 多媒体下载辅助 ────────────────────────────────────────────────────────────
+
+_MEDIA_RE = re.compile(r'!\[([^\]]*)\]\(data:([^;]+);base64,([A-Za-z0-9+/=\n]+)\)')
+
+def _extract_media(content: str) -> list[tuple[str, str, bytes]]:
+    """从消息内容中提取所有 data URI 媒体，返回 [(alt, mime, bytes), ...]。"""
+    results = []
+    for m in _MEDIA_RE.finditer(content):
+        alt, mime, b64 = m.group(1), m.group(2), m.group(3).replace("\n", "")
+        try:
+            results.append((alt or "file", mime, base64.b64decode(b64)))
+        except Exception:
+            pass
+    return results
+
+def _media_download_buttons(content: str, msg_idx: int) -> None:
+    """在消息下方渲染所有可下载媒体的下载按钮。"""
+    media_list = _extract_media(content)
+    if not media_list:
+        return
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    cols = st.columns(len(media_list))
+    for col_idx, (alt, mime, data) in enumerate(media_list):
+        # 推断扩展名
+        ext = mime.split("/")[-1].split("+")[0]   # "image/png" → "png"
+        ext_map = {"jpeg": "jpg", "svg+xml": "svg", "plain": "txt"}
+        ext = ext_map.get(ext, ext)
+        filename = f"generated_{ts}_{col_idx}.{ext}"
+        # 根据类型选择图标
+        icon = "🖼️" if mime.startswith("image/") else ("📄" if "pdf" in mime else "💾")
+        with cols[col_idx]:
+            st.download_button(
+                label=f"{icon} 下载{alt}",
+                data=data,
+                file_name=filename,
+                mime=mime,
+                key=f"dl_{msg_idx}_{col_idx}",
+                use_container_width=True,
+            )
+
+
 # ── Session state 初始化 ──────────────────────────────────────────────────────
 
 for _k, _v in [
@@ -442,6 +484,11 @@ for _k, _v in [
     ("_last_prompt", ""),                  # 最近一次用户消息（用于重试）
     ("_last_attachments", []),             # 最近一次附件（用于重试）
     ("_retry_pending", False),             # 是否触发重试
+    ("_is_generating", False),            # 是否正在生成（用于锁定 UI）
+    ("_collab_edit_open", False),         # 是否展开协作配置编辑面板
+    ("_pending_prompt", None),
+    ("_pending_attachments", []),
+    ("_pending_is_retry", False),
 ]:
     if _k not in st.session_state:
         st.session_state[_k] = _v
@@ -469,6 +516,16 @@ def _emb_label(model_id: str | None) -> str:
         if mid == model_id:
             return label
     return _EMB_LABELS[0]
+
+# ── 生成锁：streaming 期间冻结侧边栏所有交互 ──────────────────────────────────
+
+_is_generating = st.session_state.get("_is_generating", False)
+if _is_generating:
+    st.markdown(
+        "<style>section[data-testid='stSidebar']{pointer-events:none;opacity:.55}"
+        ".stChatInput textarea{pointer-events:none}</style>",
+        unsafe_allow_html=True,
+    )
 
 # ── 侧边栏 ────────────────────────────────────────────────────────────────────
 
@@ -1111,8 +1168,11 @@ with st.sidebar:
                     if ms.get("mode") in ("chat_agent", "both") and ms.get("is_active")
                 ]
                 # slot_meta: display_label → {type, ...}
+                _IMG_KW = ("dall-e", "gpt-image", "image-generation")
                 slot_meta: dict[str, dict] = {}
                 for c in configs:
+                    if any(kw in c["model"].lower() for kw in _IMG_KW):
+                        continue   # 图像生成模型不支持多模型协作
                     slot_meta[f"{c['display_name']} · {c['model']}"] = {"type": "llm", "id": c["id"]}
                 for ms in _mcp_chat_agents:
                     slot_meta[f"[MCP] {ms['display_name']}"] = {
@@ -1300,22 +1360,80 @@ if not st.session_state.active_session_id:
 
 # 顶部标题栏
 session_data = api("GET", f"/sessions/{st.session_state.active_session_id}", silent=True)
+
+# _is_collab 在标题栏渲染前确定（后续输入区也复用）
+_is_collab = bool(st.session_state.get("active_session_collab_mode"))
+
 if session_data:
     # 同步协作模式状态（切换会话时）
     if st.session_state.active_session_collab_mode != session_data.get("collab_mode"):
         st.session_state.active_session_collab_mode = session_data.get("collab_mode")
+        _is_collab = bool(session_data.get("collab_mode"))
 
-    col_title, col_model = st.columns([6, 1])
-    with col_title:
-        collab_mode = session_data.get("collab_mode")
-        _rag_active = session_data.get("rag_enabled", False)
+    collab_mode = session_data.get("collab_mode")
+    _rag_active = session_data.get("rag_enabled", False)
+
+    # 标题栏：标题(5) | 控制区(3) | 模型标签(2)
+    _hc_title, _hc_controls, _hc_model = st.columns([5, 3, 2])
+
+    with _hc_title:
         title_prefix = {"round_table": "⚡ 圆桌 · ", "master_slave": "⚡ 主从 · "}.get(collab_mode or "", "")
         rag_prefix = "🔍 RAG · " if _rag_active else ""
         st.subheader(title_prefix + rag_prefix + session_data["title"])
         sp_ref = session_data.get("system_prompt_ref")
         if sp_ref:
             st.caption(f"📋 System Prompt：`{sp_ref['name']}`")
-    with col_model:
+
+    with _hc_controls:
+        if not _is_collab:
+            _ct1, _ct2 = st.columns(2)
+            _thinking_on = _ct1.toggle(
+                "🧠",
+                value=st.session_state.get("thinking_mode", False),
+                key="thinking_toggle",
+                disabled=_is_generating,
+                help="**深度思考**：开启后模型先进行内部推理再作答，适合复杂分析、数学推导等任务。DeepSeek-R1 / QwQ / Claude 扩展思考均支持。",
+            )
+            st.session_state["thinking_mode"] = _thinking_on
+            _search_on = _ct2.toggle(
+                "🔍",
+                value=st.session_state.get("search_mode", False),
+                key="search_toggle",
+                disabled=_is_generating or not _active_search,
+                help="**网络搜索**：开启后模型可主动调用搜索引擎获取实时信息。" if _active_search
+                     else "**网络搜索**：请先在「🛠 工具 → 🔍 网络搜索」中配置搜索引擎。",
+            )
+            st.session_state["search_mode"] = _search_on
+        else:
+            _thinking_on = False
+            _search_on   = False
+            # 协作模式：显示参与模型摘要 + 编辑按钮
+            _cfg_map = {str(c["id"]): c for c in configs}
+            _ccfg = session_data.get("collab_config") or {}
+            _cmode = _ccfg.get("mode", collab_mode)
+            _model_chips: list[str] = []
+            if _cmode == "master_slave":
+                _m = _cfg_map.get(str(_ccfg.get("master_config_id", "")))
+                _model_chips.append(f"👑 {_m['display_name'] if _m else '?'}")
+                for _r in _ccfg.get("reviewer_slots", []):
+                    if _r.get("type") == "mcp":
+                        _model_chips.append(f"⚖️ [MCP]{_r.get('display_name','?')}")
+                    else:
+                        _rc = _cfg_map.get(str(_r.get("config_id", "")))
+                        _model_chips.append(f"⚖️ {_rc['display_name'] if _rc else '?'}")
+            elif _cmode == "round_table":
+                for _mi, _mm in enumerate(_ccfg.get("models", [])):
+                    if _mm.get("type") == "mcp":
+                        _model_chips.append(f"[MCP]{_mm.get('display_name','?')}")
+                    else:
+                        _mc = _cfg_map.get(str(_mm.get("config_id", "")))
+                        _model_chips.append(_mc["display_name"] if _mc else "?")
+            st.caption("  ·  ".join(_model_chips) if _model_chips else "协作配置未知")
+            if st.button("✏️ 编辑协作", key="btn_collab_edit", use_container_width=True):
+                st.session_state["_collab_edit_open"] = not st.session_state.get("_collab_edit_open", False)
+                st.rerun()
+
+    with _hc_model:
         if collab_mode:
             cfg_data = session_data.get("collab_config") or {}
             n_models = len(cfg_data.get("models", [])) or (
@@ -1325,8 +1443,122 @@ if session_data:
         else:
             model_label = active_config["model"] if active_config else "未配置"
             st.caption(f"`{model_label}`")
+else:
+    _thinking_on = False
+    _search_on   = False
 
 st.divider()
+
+# ── 协作配置编辑面板 ──────────────────────────────────────────────────────────
+if _is_collab and st.session_state.get("_collab_edit_open") and session_data:
+    _ccfg_edit = session_data.get("collab_config") or {}
+    _cmode_edit = _ccfg_edit.get("mode", collab_mode)
+    _IMG_KW2 = ("dall-e", "gpt-image", "image-generation")
+    _slot_meta_e: dict[str, dict] = {}
+    for _c in configs:
+        if not any(_kw in _c["model"].lower() for _kw in _IMG_KW2):
+            _slot_meta_e[f"{_c['display_name']} · {_c['model']}"] = {"type": "llm", "id": _c["id"]}
+    for _ms in _mcp_servers:
+        if _ms.get("mode") in ("chat_agent", "both") and _ms.get("is_active"):
+            _slot_meta_e[f"[MCP] {_ms['display_name']}"] = {
+                "type": "mcp", "server_name": _ms["name"], "display_name": _ms["display_name"],
+            }
+    _all_e = list(_slot_meta_e.keys())
+    _llm_e = [_l for _l, _v in _slot_meta_e.items() if _v["type"] == "llm"]
+    _cfg_map_e = {str(_c["id"]): _c for _c in configs}
+
+    with st.container(border=True):
+        st.caption("✏️ 修改协作配置（保存后立即生效）")
+
+        if _cmode_edit == "round_table":
+            _cur_models = _ccfg_edit.get("models", [])
+            _rounds_e = st.radio("讨论轮次", [1, 2],
+                                 index=max(0, _ccfg_edit.get("rounds", 2) - 1),
+                                 format_func=lambda x: f"{x} 轮", horizontal=True,
+                                 key="edit_rounds")
+            _ROLES_E = ["proposer", "critic", "creative", "validator", "synthesizer"]
+            _n_e = st.slider("槽位数量", 2, min(5, len(_all_e)),
+                             value=min(max(2, len(_cur_models)), 5), key="edit_n_slots")
+            _new_slots_e = []
+            for _i in range(_n_e):
+                _auto_r = _ROLES_E[min(_i, len(_ROLES_E)-1)] if _i < _n_e-1 else "synthesizer"
+                _cur_label = ""
+                if _i < len(_cur_models):
+                    _cm = _cur_models[_i]
+                    if _cm.get("type") == "mcp":
+                        _cur_label = f"[MCP] {_cm.get('display_name','')}"
+                    else:
+                        _cc = _cfg_map_e.get(str(_cm.get("config_id","")))
+                        _cur_label = f"{_cc['display_name']} · {_cc['model']}" if _cc else ""
+                _def_i = _all_e.index(_cur_label) if _cur_label in _all_e else min(_i, len(_all_e)-1)
+                _sel_e = st.selectbox(f"槽位 {_i+1}：{_auto_r}", _all_e,
+                                      index=_def_i, key=f"edit_slot_{_i}")
+                _new_slots_e.append(_sel_e)
+            if st.button("💾 保存圆桌配置", type="primary", key="save_rt_edit"):
+                _roles_e = [_ROLES_E[min(_i, len(_ROLES_E)-1)] if _i < _n_e-1 else "synthesizer"
+                            for _i in range(_n_e)]
+                _models_e = []
+                for _lbl, _role in zip(_new_slots_e, _roles_e):
+                    _inf = _slot_meta_e[_lbl]
+                    if _inf["type"] == "mcp":
+                        _models_e.append({"type":"mcp","server_name":_inf["server_name"],
+                                          "display_name":_inf["display_name"],"role":_role})
+                    else:
+                        _models_e.append({"type":"llm","config_id":str(_inf["id"]),"role":_role})
+                _new_cfg = {"mode":"round_table","rounds":_rounds_e,"models":_models_e}
+                api("PATCH", f"/sessions/{st.session_state.active_session_id}",
+                    json={"collab_config": _new_cfg})
+                st.session_state["_collab_edit_open"] = False
+                st.rerun()
+
+        else:  # master_slave
+            _cur_master_id = str(_ccfg_edit.get("master_config_id",""))
+            _cur_master_lbl = ""
+            _mc_e = _cfg_map_e.get(_cur_master_id)
+            if _mc_e:
+                _cur_master_lbl = f"{_mc_e['display_name']} · {_mc_e['model']}"
+            _master_def = _llm_e.index(_cur_master_lbl) if _cur_master_lbl in _llm_e else 0
+            _master_sel_e = st.selectbox("主模型（LLM）", _llm_e or _all_e,
+                                         index=_master_def, key="edit_master")
+            _rev_pool_e = [_l for _l in _all_e if _l != _master_sel_e] or _all_e
+            _cur_revs = _ccfg_edit.get("reviewer_slots", [])
+            _n_rev_e = st.slider("评委数量", 1, min(4, len(_rev_pool_e)),
+                                 value=min(max(1, len(_cur_revs)), 4), key="edit_n_rev")
+            _new_revs_e = []
+            for _i in range(_n_rev_e):
+                _cur_rv_lbl = ""
+                if _i < len(_cur_revs):
+                    _rv = _cur_revs[_i]
+                    if _rv.get("type") == "mcp":
+                        _cur_rv_lbl = f"[MCP] {_rv.get('display_name','')}"
+                    else:
+                        _rvc = _cfg_map_e.get(str(_rv.get("config_id","")))
+                        _cur_rv_lbl = f"{_rvc['display_name']} · {_rvc['model']}" if _rvc else ""
+                _rv_def = _rev_pool_e.index(_cur_rv_lbl) if _cur_rv_lbl in _rev_pool_e else min(_i, len(_rev_pool_e)-1)
+                _sel_rv = st.selectbox(f"评委 {_i+1}", _rev_pool_e,
+                                       index=_rv_def, key=f"edit_rev_{_i}")
+                _new_revs_e.append(_sel_rv)
+            if st.button("💾 保存主从配置", type="primary", key="save_ms_edit"):
+                _rev_slots_e = []
+                for _lbl in _new_revs_e:
+                    _inf = _slot_meta_e[_lbl]
+                    if _inf["type"] == "mcp":
+                        _rev_slots_e.append({"type":"mcp","server_name":_inf["server_name"],
+                                             "display_name":_inf["display_name"]})
+                    else:
+                        _rev_slots_e.append({"type":"llm","config_id":str(_inf["id"])})
+                _m_inf = _slot_meta_e[_master_sel_e]
+                _new_cfg = {"mode":"master_slave",
+                            "master_config_id":str(_m_inf["id"]),
+                            "reviewer_slots":_rev_slots_e}
+                api("PATCH", f"/sessions/{st.session_state.active_session_id}",
+                    json={"collab_config": _new_cfg})
+                st.session_state["_collab_edit_open"] = False
+                st.rerun()
+
+        if st.button("✖ 取消", key="cancel_collab_edit"):
+            st.session_state["_collab_edit_open"] = False
+            st.rerun()
 
 # 渲染历史消息
 _history = st.session_state.chat_history
@@ -1357,6 +1589,8 @@ for i, msg in enumerate(_history):
             with st.expander(f"🧠 思考完毕（{len(msg['thinking'])} 字符）", expanded=False):
                 st.markdown(msg["thinking"])
         st.markdown(msg["content"])
+        if msg["role"] == "assistant":
+            _media_download_buttons(msg["content"], i)
 
     # ── 最后一条 assistant 消息下方：重试 / 复制按钮 ──────────────────────────
     if _is_last_assistant:
@@ -1395,23 +1629,35 @@ if _copy_content:
 
 # ── 对话输入 ──────────────────────────────────────────────────────────────────
 
-_is_collab = bool(st.session_state.get("active_session_collab_mode"))
 _hint = "发送消息给协作团队..." if _is_collab else "发送消息给 AgentNexus-J..."
 
-# 消费重试标志（在渲染 chat_input 之前）
+# 消费重试标志
 _is_retry = st.session_state.pop("_retry_pending", False)
 _effective_prompt: str | None = None
 _effective_attachments: list[dict] = []
 
-if _is_retry:
-    _effective_prompt    = st.session_state.get("_last_prompt", "")
-    _effective_attachments = st.session_state.get("_last_attachments", [])
+# 重试：进入预飞流程（锁 UI 后再执行）
+if _is_retry and not _is_generating:
+    st.session_state["_pending_prompt"]      = st.session_state.get("_last_prompt", "")
+    st.session_state["_pending_attachments"] = st.session_state.get("_last_attachments", [])
+    st.session_state["_pending_is_retry"]    = True
+    st.session_state["_is_generating"]       = True
+    st.rerun()
 
-# 文件上传器（协作模式不支持附件）
+# 文件上传器（协作模式不支持附件，生成中隐藏）
 _uploaded_files: list = []
-if not _is_collab and st.session_state.active_session_id:
+if not _is_collab and not _is_generating and st.session_state.active_session_id:
+    st.markdown(
+        "<style>"
+        "[data-testid='stFileUploader']{border:1px dashed #555;border-radius:8px;padding:2px 8px}"
+        "[data-testid='stFileUploaderDropzone']{padding:6px 12px;min-height:0}"
+        "[data-testid='stFileUploaderDropzone'] span{font-size:.8rem}"
+        "[data-testid='stFileUploaderDropzone'] small{display:none}"
+        "</style>",
+        unsafe_allow_html=True,
+    )
     _uploaded_files = st.file_uploader(
-        "附件",
+        "📎 添加附件",
         accept_multiple_files=True,
         key=f"file_up_{st.session_state._upload_generation}",
         type=["jpg", "jpeg", "png", "gif", "webp", "pdf",
@@ -1422,43 +1668,32 @@ if not _is_collab and st.session_state.active_session_id:
              "如 Claude 3+、GPT-4o、qwen-vl-max 等，文本类文件对所有模型适用。",
     ) or []
 
-# 深度思考 + 网络搜索 toggle（普通会话才有意义）
-if not _is_collab:
-    _tc, _sc = st.columns(2)
-    _thinking_on = _tc.toggle(
-        "🧠 深度思考",
-        value=st.session_state.get("thinking_mode", False),
-        key="thinking_toggle",
-        help="开启后模型将先进行内部推理再作答，适合复杂分析、数学推导等任务。DeepSeek-R1 / QwQ / Claude 扩展思考均支持。",
-    )
-    _search_default = st.session_state.get("search_mode", False)
-    _search_on = _sc.toggle(
-        "🔍 网络搜索",
-        value=_search_default,
-        key="search_toggle",
-        disabled=not _active_search,
-        help="开启后 LLM 可主动调用搜索引擎获取实时信息。" if _active_search
-             else "请先在「🛠 工具 → 🔍 网络搜索」中配置搜索引擎。",
-    )
-    st.session_state["thinking_mode"] = _thinking_on
-    st.session_state["search_mode"] = _search_on
-else:
-    _thinking_on = False
-    _search_on = False
-
-# 新消息输入
-_input_prompt = st.chat_input(_hint)
-if _input_prompt and not _is_retry:
-    _effective_prompt = _input_prompt
+# 新消息输入（生成中禁用）
+_input_prompt = st.chat_input(_hint, disabled=_is_generating)
+if _input_prompt and not _is_generating:
+    # 收集附件
+    _atts: list[dict] = []
     for _f in _uploaded_files:
         _f.seek(0)
-        _effective_attachments.append({
+        _atts.append({
             "filename": _f.name,
             "mime_type": _f.type or "application/octet-stream",
             "data": base64.b64encode(_f.read()).decode(),
         })
-    if _effective_attachments:
+    if _atts:
         st.session_state["_upload_generation"] += 1
+    # 预飞：锁 UI 后再 streaming
+    st.session_state["_pending_prompt"]      = _input_prompt
+    st.session_state["_pending_attachments"] = _atts
+    st.session_state["_pending_is_retry"]    = False
+    st.session_state["_is_generating"]       = True
+    st.rerun()
+
+# 消费 pending（本轮真正执行生成）
+if _is_generating and st.session_state.get("_pending_prompt") is not None:
+    _effective_prompt      = st.session_state.pop("_pending_prompt")
+    _effective_attachments = st.session_state.pop("_pending_attachments", [])
+    _is_retry              = st.session_state.pop("_pending_is_retry", False)
 
 if _effective_prompt:
     if not _is_collab and not active_config:
@@ -1485,6 +1720,8 @@ if _effective_prompt:
                 else:
                     st.caption(f"📄 {_att['filename']}")
             st.markdown(_effective_prompt)
+
+    _saved_thinking = ""   # 协作模式无 thinking，统一初始化避免 NameError
 
     if _is_collab:
         with st.chat_message("assistant"):
@@ -1664,4 +1901,5 @@ if _effective_prompt:
         if _saved_thinking:
             entry["thinking"] = _saved_thinking
         st.session_state.chat_history.append(entry)
+    st.session_state["_is_generating"] = False
     st.rerun()

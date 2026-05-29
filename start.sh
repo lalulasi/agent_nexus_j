@@ -35,6 +35,18 @@ trap cleanup EXIT
 
 cd "$SCRIPT_DIR"
 
+# ── 0. 解析参数 ────────────────────────────────────────────────
+CLEAN=0
+for arg in "$@"; do
+    [ "$arg" = "--clean" ] && CLEAN=1
+done
+
+if [ "$CLEAN" = "1" ]; then
+    step "清除数据库数据（--clean）..."
+    docker compose down --volumes
+    ok "数据已清除"
+fi
+
 # ── 1. 前置检查 ────────────────────────────────────────────────
 step "检查依赖..."
 
